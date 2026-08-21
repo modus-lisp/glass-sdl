@@ -52,11 +52,24 @@ Two things the binding has to get right, both discovered the hard way:
 
 ## Platforms
 
+All three verified with `inspect/bindings-probe.lisp`, which asks what a port
+actually turns on: is the library found, do the symbols resolve, do the calls
+return what C says, are the struct offsets right, does a pinned Lisp vector
+upload as a texture.
+
 | | state |
 |---|---|
-| **macOS** (arm64) | **verified end to end** — window on screen against a live desktop, input round-tripped |
-| **Linux** (aarch64) | **bindings verified** — builds, finds libSDL2, `SDL_Init`/window/renderer/texture/`PollEvent` all succeed. Tested with `SDL_VIDEODRIVER=dummy` in a container, so pixels-on-a-real-display is the one step not exercised |
-| **Windows** | **untested.** Believed close: `SDL2.dll` is in the search list, the `SDL_Event` ABI is identical, and nothing here uses `sb-posix` (which Windows SBCL lacks). Unverified is unverified |
+| **macOS** (arm64, SBCL 2.5.6) | **end to end** — 13/13, plus a window on screen against a live desktop with input round-tripped |
+| **Windows 11** (x86-64, SBCL 2.5.6) | **13/13**, with the *real* video driver — `SDL_CreateWindow` against an actual compositor |
+| **Linux** (aarch64, SBCL 2.5.2) | **bindings verified** — 13/13 under `SDL_VIDEODRIVER=dummy`, so everything but pixels-reaching-a-display |
+
+One route that does **not** work, recorded so nobody repeats it: Wine inside an
+x86-64 Linux container on Apple silicon. Wine, the SBCL msi and SDL2.dll all
+install fine, but `--platform linux/amd64` there is Rosetta, and Rosetta does not
+implement the segment selector SBCL uses for thread-local storage. `sbcl.exe
+--version` prints (it exits before the runtime initialises); anything that
+evaluates Lisp dies with `rosetta error: invalid gdt selector index 5`. Windows
+needs a Windows kernel — a real machine or a CI runner.
 
 libSDL2 at runtime:
 
