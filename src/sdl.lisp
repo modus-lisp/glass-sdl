@@ -16,11 +16,15 @@
 (in-package #:glass-sdl)
 
 (defparameter *sdl-candidates*
-  '("libSDL2-2.0.0.dylib" "libSDL2.dylib"          ; macOS
-    "libSDL2-2.0.so.0" "libSDL2.so"                ; Linux
-    "/opt/homebrew/lib/libSDL2-2.0.0.dylib"
-    "/usr/local/lib/libSDL2-2.0.0.dylib")
-  "Tried in order.  A bare soname first so the system loader gets its say.")
+  #+darwin '("libSDL2-2.0.0.dylib" "libSDL2.dylib"
+             "/opt/homebrew/lib/libSDL2-2.0.0.dylib"   ; Homebrew, Apple silicon
+             "/usr/local/lib/libSDL2-2.0.0.dylib")     ; Homebrew, Intel
+  #+win32 '("SDL2.dll")
+  #-(or darwin win32) '("libSDL2-2.0.so.0" "libSDL2.so"
+                        "/usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0"
+                        "/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0")
+  "Tried in order.  Bare sonames first, so the system loader gets its say and a
+   package-managed copy wins over a guessed path.")
 
 (defvar *sdl-loaded* nil)
 

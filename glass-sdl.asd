@@ -15,7 +15,9 @@ boundary."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("glass/client" "sb-posix")
+  ;; sb-alien, sb-sys and sb-int only -- deliberately no sb-posix, which does not
+  ;; exist on Windows and which nothing here needs.
+  :depends-on ("glass/client")
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")

@@ -50,14 +50,24 @@ Two things the binding has to get right, both discovered the hard way:
 - **The main thread.** macOS insists the event loop is the main thread, so `view`
   is a function you *call* from yours rather than a server you start.
 
-## Requirements
+## Platforms
 
-SBCL, and libSDL2 at runtime:
+| | state |
+|---|---|
+| **macOS** (arm64) | **verified end to end** — window on screen against a live desktop, input round-tripped |
+| **Linux** (aarch64) | **bindings verified** — builds, finds libSDL2, `SDL_Init`/window/renderer/texture/`PollEvent` all succeed. Tested with `SDL_VIDEODRIVER=dummy` in a container, so pixels-on-a-real-display is the one step not exercised |
+| **Windows** | **untested.** Believed close: `SDL2.dll` is in the search list, the `SDL_Event` ABI is identical, and nothing here uses `sb-posix` (which Windows SBCL lacks). Unverified is unverified |
+
+libSDL2 at runtime:
 
 ```sh
 brew install sdl2          # macOS
 apt install libsdl2-2.0-0  # Debian/Ubuntu
 ```
+
+The macOS main-thread rule is macOS's alone; Linux and Windows have no such
+constraint, though calling `view` from your main thread is still the simplest
+thing to do.
 
 ## Input
 
