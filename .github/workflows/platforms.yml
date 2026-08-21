@@ -1,0 +1,68 @@
+# Does the FFI hold together on each platform?
+#
+# macOS is developed on and Linux is easy to reach, but Windows cannot be tested
+# from either: containers share the host kernel, so a Windows image needs a
+# Windows machine. A CI runner IS that machine, which makes this the only honest
+# way to answer the question — and it keeps answering it.
+name: platforms
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: glass-sdl }
+
+      # glass-sdl is one repo in a workspace of them; the probe finds siblings
+      # relative to itself, so they have to sit beside it.
+      - name: Sibling checkouts
+        shell: bash
+        run: |
+          for r in glass cram; do
+            git clone --depth 1 -q https://github.com/modus-lisp/$r.git "$r"
+          done
+
+      - name: SBCL and SDL2 (linux)
+        if: matrix.name == 'linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sbcl libsdl2-2.0-0
+
+      - name: SBCL and SDL2 (macos)
+        if: matrix.name == 'macos'
+        run: brew install sbcl sdl2
+
+      - name: SBCL and SDL2 (windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          choco install sbcl --no-progress -y
+          # SDL2's own release zip: the runtime DLL, dropped where the loader looks.
+          $v = "2.30.9"
+          Invoke-WebRequest -Uri "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL2-$v-win32-x64.zip" -OutFile sdl2.zip
+          Expand-Archive sdl2.zip -DestinationPath sdl2
+          Copy-Item sdl2\SDL2.dll $env:GITHUB_WORKSPACE\SDL2.dll
+          echo "$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Probe
+        shell: bash
+        # No display on any runner, so SDL's dummy driver stands in. That exercises
+        # the library lookup, every symbol, the struct offsets and the pixel upload
+        # — everything except pixels reaching a screen.
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: sbcl --script glass-sdl/inspect/bindings-probe.lisp
