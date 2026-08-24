@@ -11,8 +11,87 @@
   "The viewer most recently started, so a REPL (or a test) can reach the remote
    that is on screen without threading it through by hand.")
 
+;;; ---- where the pixels come from ----------------------------------------------
+;;;
+;;; The viewer needs eight things from a desktop: its framebuffer, its size, whether it
+;;; is still there, whether it has changed, and somewhere to put keys and pointer events.
+;;; An RFB connection is ONE way to have those.  It is not the only one, and in the case
+;;; that matters most it is the silly one: a desktop in this same image already holds the
+;;; pixels as an object, and going through a socket to get them means encoding a screen we
+;;; are holding, writing it to the kernel, reading it back and decoding it.
+;;;
+;;; So the eight are a struct of closures, and the transport is a detail of which
+;;; constructor was called.  MAKE-REMOTE-SOURCE is glass/client, as before.
+;;; MAKE-SEAT-SOURCE is a seat in this process, with nothing between.
+(defstruct (source (:conc-name src-))
+  fb          ; () -> framebuffer
+  width       ; () -> px
+  height      ; () -> px
+  live-p      ; () -> generalized boolean
+  dirty-p     ; () -> T if the screen changed since the last call
+  key         ; (down-p keysym) -> ignored
+  pointer     ; (button-mask x y) -> ignored
+  stop        ; () -> ignored
+  on-resize)  ; (function-of-w-and-h) -> ignored; installs a resize callback
+
+(defun make-remote-source (host port)
+  "A desktop reached over RFB — another machine, or a container, or this one."
+  (let ((r (glass-client:connect-remote host port)))
+    (make-source :fb        (lambda () (glass-client:remote-fb r))
+                 :width     (lambda () (glass-client:remote-width r))
+                 :height    (lambda () (glass-client:remote-height r))
+                 :live-p    (lambda () (glass-client:remote-connected-p r))
+                 :dirty-p   (lambda () (glass-client:remote-take-dirty r))
+                 :key       (lambda (down k) (glass-client:remote-key r down k))
+                 :pointer   (lambda (b x y) (glass-client:remote-pointer r b x y))
+                 :stop      (lambda () (glass-client:remote-stop r))
+                 :on-resize (lambda (fn) (setf (glass-client:remote-on-resize r) fn)))))
+
+(defun make-seat-source (seat)
+  "A desktop in THIS image: no socket, no handshake, no encode/decode round trip.
+
+   Dirtiness is GLASS:FB-FRAMENO, which the compositor advances on every change.
+   Comparing it is exact where polling the seat's wake condition would race -- a
+   broadcast that lands between two polls is simply lost, and the screen would then sit
+   stale until something else happened to change."
+  ;; Looked up by NAME, not depended on.  ATTACH-SEAT-LOCAL lives in the window-manager
+  ;; layer, and this system must not pull that in to open a window: glass-sdl is a viewer,
+  ;; and what it views is somebody else's business.  A caller holding a seat has already
+  ;; loaded whatever made it.
+  (let ((attach (find-symbol "ATTACH-SEAT-LOCAL" "CLIM-GLASS")))
+    (unless (and attach (fboundp attach))
+      (error "glass-sdl: :SEAT needs CLIM-GLASS:ATTACH-SEAT-LOCAL, which is not in this ~
+              image -- load the window-manager layer, or pass :HOST/:PORT instead."))
+  (multiple-value-bind (fb on-key on-pointer on-resize wake)
+      (funcall attach seat)
+    ;; WAKE is the compositor's condition variable and FB-FRAMENO says the same thing
+    ;; without the race, so it is not used here.  ON-RESIZE is the other direction --
+    ;; "this viewer wants a different desktop size" -- and nothing drives it yet: the
+    ;; window is resizable and the picture refits, but dragging an edge does not resize
+    ;; the DESKTOP.  Named rather than swallowed, because the seam is right here.
+    (declare (ignore wake on-resize))
+    (let ((seen -1) (resize-cb nil) (last-w (glass:fb-width fb)) (last-h (glass:fb-height fb)))
+      (make-source
+       :fb        (lambda () fb)
+       :width     (lambda () (glass:fb-width fb))
+       :height    (lambda () (glass:fb-height fb))
+       :live-p    (lambda () t)             ; it is us; it cannot go away without us
+       :dirty-p   (lambda ()
+                    ;; ...and notice a resize on the way past, since there is no
+                    ;; server here to announce one.
+                    (let ((w (glass:fb-width fb)) (h (glass:fb-height fb)))
+                      (unless (and (eql w last-w) (eql h last-h))
+                        (setf last-w w last-h h)
+                        (when resize-cb (funcall resize-cb w h))))
+                    (let ((n (glass:fb-frameno fb)))
+                      (and (/= n seen) (setf seen n) t)))
+       :key       (lambda (down k) (funcall on-key down k))
+       :pointer   (lambda (b x y) (funcall on-pointer b x y))
+       :stop      (lambda () nil)           ; nothing was opened, so nothing is closed
+       :on-resize (lambda (fn) (setf resize-cb fn) (values)))))))
+
 (defstruct (viewer (:conc-name v-))
-  remote window renderer texture
+  source window renderer texture
   (width 0) (height 0)
   (buttons 0)                      ; RFB button mask, held across motion events
   (last-x 0) (last-y 0)            ; a wheel event carries no position
@@ -35,7 +114,7 @@
    flag rather than a rectangle list, so there is nothing finer to act on, and a
    1280x800 upload is four megabytes of memcpy that a GPU eats without noticing.
    Idle costs nothing because we only get here when the flag was set."
-  (let* ((fb (glass-client:remote-fb (v-remote v)))
+  (let* ((fb (funcall (src-fb (v-source v))))
          (px (glass:fb-pixels fb)))
     (sb-sys:with-pinned-objects (px)
       (sdl (%update-texture (v-texture v) (null-ptr)
@@ -54,7 +133,7 @@
 (defun handle-event (v sap)
   "Translate one SDL event and forward it.  Returns NIL to stop the viewer."
   (let ((type (ev-u32 sap 0))
-        (r (v-remote v)))
+        (r (v-source v)))
     (cond
       ((= type +quit+) nil)
 
@@ -66,12 +145,12 @@
        ;; keysym.sym is an Sint32 at offset 20 of SDL_KeyboardEvent.
        (let ((keysym (sdl->keysym (ev-i32 sap 20))))
          (when keysym
-           (glass-client:remote-key r (= type +key-down+) keysym)))
+           (funcall (src-key r) (= type +key-down+) keysym)))
        t)
 
       ((= type +mouse-motion+)
        (setf (v-last-x v) (ev-i32 sap 20) (v-last-y v) (ev-i32 sap 24))
-       (glass-client:remote-pointer r (v-buttons v) (v-last-x v) (v-last-y v))
+       (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v))
        t)
 
       ((or (= type +mouse-button-down+) (= type +mouse-button-up+))
@@ -80,7 +159,7 @@
          (setf (v-buttons v) (if (= type +mouse-button-down+)
                                  (logior (v-buttons v) bit)
                                  (logandc2 (v-buttons v) bit)))
-         (glass-client:remote-pointer r (v-buttons v) (ev-i32 sap 20) (ev-i32 sap 24)))
+         (funcall (src-pointer r) (v-buttons v) (ev-i32 sap 20) (ev-i32 sap 24)))
        t)
 
       ((= type +mouse-wheel+)
@@ -90,39 +169,61 @@
               (bit (cond ((plusp dy) 8) ((minusp dy) 16) (t 0))))
          (unless (zerop bit)
            (let ((x (v-last-x v)) (y (v-last-y v)))
-             (glass-client:remote-pointer r (logior (v-buttons v) bit) x y)
-             (glass-client:remote-pointer r (v-buttons v) x y))))
+             (funcall (src-pointer r) (logior (v-buttons v) bit) x y)
+             (funcall (src-pointer r) (v-buttons v) x y))))
        t)
 
       (t t))))
 
 ;;; ---- the loop ----------------------------------------------------------------
 
-(defun view (&key (host "127.0.0.1") (port 5901) (title nil) (fps 60))
-  "Open a window onto the glass desktop at HOST:PORT and pump it until closed.
+(defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60))
+  "Open a window onto a glass desktop and pump it until closed.
 
    Runs on the calling thread and does not return until the window closes, which
    on macOS is not a preference: Cocoa insists the event loop is the main thread,
    so this is a function you CALL from your main thread rather than a server you
-   start."
+   start.
+
+   SEAT is a desktop in THIS image (CLIM-GLASS:ADD-WM-SEAT, typically made with
+   :SERVE NIL) and there is no transport at all: the framebuffer is read where it
+   already is and keys go straight to the seat's injector.  Otherwise HOST:PORT is
+   an RFB desktop somewhere -- a hostname beside a port, or `unix:/path/seat-1.rfb'
+   for a socket file, which is the same thing with the kernel checking who may
+   connect.
+
+   The one-image case is the point rather than an optimisation.  On the hardware
+   this is aimed at there is no socket to have and no second process to be: the
+   desktop composites into a framebuffer and something puts that on a screen.  Here
+   that something is SDL; there it is glass/fb itself."
   (load-sdl)
   (unless (zerop (sdl (%init +init-video+)))
     (error "glass-sdl: SDL_Init failed: ~a" (sdl (%get-error))))
-  (let ((v (setf *probe-viewer* (make-viewer :remote (glass-client:connect-remote host port))))
+  (let ((v (setf *probe-viewer*
+                 (make-viewer :source (if seat
+                                          (make-seat-source seat)
+                                          (make-remote-source host port)))))
         (ev (sb-alien:make-alien (sb-alien:unsigned 8) 64)))
     (unwind-protect
-         (let ((r (v-remote v)))
-           ;; Wait for the handshake so the window opens at the remote's size
-           ;; rather than opening small and jumping.
-           (loop repeat 200 until (glass-client:remote-connected-p r) do (sleep 0.05))
-           (unless (glass-client:remote-connected-p r)
+         (let ((r (v-source v)))
+           ;; Wait for the handshake so the window opens at the desktop's size
+           ;; rather than opening small and jumping.  A local seat is up already.
+           (loop repeat 200 until (funcall (src-live-p r)) do (sleep 0.05))
+           (unless (funcall (src-live-p r))
              (error "glass-sdl: no answer from ~a:~d" host port))
-           (setf (v-width v) (glass-client:remote-width r)
-                 (v-height v) (glass-client:remote-height r))
-           (setf (glass-client:remote-on-resize r)
-                 (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
+           (setf (v-width v) (funcall (src-width r))
+                 (v-height v) (funcall (src-height r)))
+           (funcall (src-on-resize r)
+                    (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
            (setf (v-window v)
-                 (sdl (%create-window (or title (format nil "glass — ~a:~d" host port))
+                 (sdl (%create-window (or title
+                                          (if seat
+                                              (let ((n (find-symbol "SEAT-NAME" "CLIM-GLASS")))
+                                                (format nil "glass — ~a"
+                                                        (or (and n (fboundp n)
+                                                                 (ignore-errors (funcall n seat)))
+                                                            "desktop")))
+                                              (format nil "glass — ~a:~d" host port)))
                                       #x1FFF0000 #x1FFF0000
                                       (v-width v) (v-height v)
                                       (logior +window-shown+ +window-resizable+))))
@@ -143,19 +244,19 @@
                      do (unless (handle-event v sap) (return-from view t)))
                (when (v-resized v)
                  (setf (v-resized v) nil
-                       (v-width v) (glass-client:remote-width r)
-                       (v-height v) (glass-client:remote-height r))
+                       (v-width v) (funcall (src-width r))
+                       (v-height v) (funcall (src-height r)))
                  (sdl (%set-window-size (v-window v) (v-width v) (v-height v)))
                  (make-texture v)
                  (push-frame v))
-               (if (glass-client:remote-take-dirty r)
+               (if (funcall (src-dirty-p r))
                    (push-frame v)
                    (sdl (%delay frame-ms)))
-               (unless (glass-client:remote-connected-p r)
+               (unless (funcall (src-live-p r))
                  ;; The client reconnects on its own; say so rather than dying.
                  (sdl (%set-window-title (v-window v) "glass — reconnecting…"))
                  (sdl (%delay 200))))))
-      (ignore-errors (glass-client:remote-stop (v-remote v)))
+      (ignore-errors (funcall (src-stop (v-source v))))
       (when (v-texture v) (ignore-errors (sdl (%destroy-texture (v-texture v)))))
       (when (v-renderer v) (ignore-errors (sdl (%destroy-renderer (v-renderer v)))))
       (when (v-window v) (ignore-errors (sdl (%destroy-window (v-window v)))))
