@@ -32,7 +32,8 @@
   key         ; (down-p keysym) -> ignored
   pointer     ; (button-mask x y) -> ignored
   stop        ; () -> ignored
-  on-resize)  ; (function-of-w-and-h) -> ignored; installs a resize callback
+  on-resize   ; (function-of-w-and-h) -> ignored; installs a resize callback
+  want-size)  ; (w h) -> ignored; ASK the desktop to become this size
 
 (defun make-remote-source (host port)
   "A desktop reached over RFB — another machine, or a container, or this one."
@@ -45,7 +46,11 @@
                  :key       (lambda (down k) (glass-client:remote-key r down k))
                  :pointer   (lambda (b x y) (glass-client:remote-pointer r b x y))
                  :stop      (lambda () (glass-client:remote-stop r))
-                 :on-resize (lambda (fn) (setf (glass-client:remote-on-resize r) fn)))))
+                 :on-resize (lambda (fn) (setf (glass-client:remote-on-resize r) fn))
+                 ;; A viewer does not get to resize somebody else's desktop over RFB --
+                 ;; that needs the extended-desktop-size pseudo-encoding, which glass's
+                 ;; client does not speak.  Saying so as a no-op beats pretending.
+                 :want-size (lambda (w h) (declare (ignore w h)) nil))))
 
 (defun make-seat-source (seat)
   "A desktop in THIS image: no socket, no handshake, no encode/decode round trip.
@@ -64,12 +69,9 @@
               image -- load the window-manager layer, or pass :HOST/:PORT instead."))
   (multiple-value-bind (fb on-key on-pointer on-resize wake)
       (funcall attach seat)
-    ;; WAKE is the compositor's condition variable and FB-FRAMENO says the same thing
-    ;; without the race, so it is not used here.  ON-RESIZE is the other direction --
-    ;; "this viewer wants a different desktop size" -- and nothing drives it yet: the
-    ;; window is resizable and the picture refits, but dragging an edge does not resize
-    ;; the DESKTOP.  Named rather than swallowed, because the seam is right here.
-    (declare (ignore wake on-resize))
+    ;; WAKE is the compositor's condition variable; FB-FRAMENO says the same thing
+    ;; without the race, so it is not used here.
+    (declare (ignore wake))
     (let ((seen -1) (resize-cb nil) (last-w (glass:fb-width fb)) (last-h (glass:fb-height fb)))
       (make-source
        :fb        (lambda () fb)
@@ -88,7 +90,12 @@
        :key       (lambda (down k) (funcall on-key down k))
        :pointer   (lambda (b x y) (funcall on-pointer b x y))
        :stop      (lambda () nil)           ; nothing was opened, so nothing is closed
-       :on-resize (lambda (fn) (setf resize-cb fn) (values)))))))
+       :on-resize (lambda (fn) (setf resize-cb fn) (values))
+       ;; The window IS the desktop here, so dragging its edge resizes the DESKTOP rather
+       ;; than stretching a picture of one.  ATTACH-SEAT-LOCAL hands us the seat's own
+       ;; resize -- not glass's SetDesktopSize callback, which resizes an application's
+       ;; window and is the wrong end of the problem for a viewer holding a whole screen.
+       :want-size (lambda (w h) (funcall on-resize w h)))))))
 
 (defstruct (viewer (:conc-name v-))
   source window renderer texture
@@ -139,6 +146,18 @@
 
       ((= type +window-event+)
        (let ((what (ev-u8 sap 12)))
+         (when (= what +windowevent-size-changed+)
+           ;; SDL_WindowEvent carries the new size in data1/data2, at 16 and 20.
+           ;;
+           ;; ONLY WHEN IT DIFFERS, and that guard is the whole of what keeps this from
+           ;; oscillating: the desktop resizing makes the loop below call
+           ;; %SET-WINDOW-SIZE, which SDL answers with another SIZE-CHANGED, which would
+           ;; ask for the size we are already at, forever.
+           (let ((w (ev-i32 sap 16)) (h (ev-i32 sap 20)))
+             (when (and (plusp w) (plusp h)
+                        (not (and (eql w (funcall (src-width r)))
+                                  (eql h (funcall (src-height r))))))
+               (funcall (src-want-size r) w h))))
          (not (= what +windowevent-close+))))
 
       ((or (= type +key-down+) (= type +key-up+))
