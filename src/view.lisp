@@ -236,12 +236,23 @@
                     (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
            (setf (v-window v)
                  (sdl (%create-window (or title
+                                          ;; THE SESSION's name, which is what an RFB
+                                          ;; client puts in its title bar and what the
+                                          ;; desktop writes in its own corner — the same
+                                          ;; name in all three places.  The seat is a
+                                          ;; place at the session, not the thing being
+                                          ;; looked at, so it is the fallback and not the
+                                          ;; answer.
                                           (if seat
                                               (let ((n (find-symbol "SEAT-NAME" "CLIM-GLASS")))
                                                 (format nil "glass — ~a"
-                                                        (or (and n (fboundp n)
-                                                                 (ignore-errors (funcall n seat)))
-                                                            "desktop")))
+                                                        (if (and (stringp glass:*desktop-name*)
+                                                                 (plusp (length glass:*desktop-name*))
+                                                                 (not (string= glass:*desktop-name* "glass")))
+                                                            glass:*desktop-name*
+                                                            (or (and n (fboundp n)
+                                                                     (ignore-errors (funcall n seat)))
+                                                                "desktop"))))
                                               (format nil "glass — ~a:~d" host port)))
                                       #x1FFF0000 #x1FFF0000
                                       (v-width v) (v-height v)
