@@ -523,7 +523,13 @@
                                                                   "desktop"))))
                                                 (format nil "glass — ~a:~d" host port)))
                                         #x1FFF0000 #x1FFF0000
-                                        (v-width v) (v-height v)
+                                        ;; IN POINTS, which is what SDL_CreateWindow takes — the framebuffer is in PIXELS.
+                                        ;; Handing it pixels asks for a window SCALE times too big on a Retina panel; it
+                                        ;; only looked right while the request happened to exceed the screen and was
+                                        ;; clamped back, which is a coincidence that held for one --size and no other.
+                                        ;; DISPLAY-SCALE answers before this window exists, which is what it is for.
+                                        (max 1 (round (v-width v) (display-scale)))
+                                        (max 1 (round (v-height v) (display-scale)))
                                         (logior +window-shown+ +window-resizable+
                                                 ;; Ask for the panel's real pixels.  Without this macOS gives a
                                                 ;; 1x backing store and the window server upscales it -- we pay
