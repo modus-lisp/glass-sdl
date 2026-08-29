@@ -17,10 +17,16 @@ boundary."
   :license "MIT"
   ;; sb-alien, sb-sys and sb-int only -- deliberately no sb-posix, which does not
   ;; exist on Windows and which nothing here needs.
-  :depends-on ("glass/client")
+    ;; glass/audio for the session mix a local viewer plays.  A viewer that could show the
+  ;; desktop but not hear it was the state of things until now -- and on the welded desktop
+  ;; (one process, its own window, no wire) there is no socket for sound to arrive on, so it
+  ;; is pulled from the mixer directly.  Same capability as the WebRTC gateway's, without any
+  ;; of its connectivity: there is nothing to connect to when the mixer is in this image.
+  :depends-on ("glass/client" "glass/audio")
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")
                              (:file "sdl")
                              (:file "keys")
+                             (:file "audio")
                              (:file "view")))))

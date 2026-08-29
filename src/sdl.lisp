@@ -98,6 +98,31 @@
 (sb-alien:define-alien-routine ("SDL_StartTextInput" %start-text-input) sb-alien:void)
 (sb-alien:define-alien-routine ("SDL_Delay" %delay) sb-alien:void (ms sb-alien:unsigned-int))
 
+;;; ---- audio out ---------------------------------------------------------------
+;;; QUEUED, not callback-driven, and that is a deliberate choice rather than the easy one.
+;;; SDL's callback runs on the audio device's own real-time thread; having it call into Lisp
+;;; means a GC pause can land inside it, and a GC pause inside an audio callback is an
+;;; audible click.  SDL_QueueAudio moves the direction of control: an ordinary Lisp thread
+;;; pushes frames whenever it likes and SDL drains them on its own thread, in C, where
+;;; nothing of ours can stall.  The cost is that we have to watch the queue depth ourselves,
+;;; which SEE PUMP-AUDIO does.
+(defconstant +init-audio+ #x10)
+(defconstant +audio-s16lsb+ #x8010)
+(sb-alien:define-alien-routine ("SDL_OpenAudioDevice" %open-audio-device) sb-alien:unsigned-int
+  (device sb-alien:c-string) (iscapture sb-alien:int)
+  (desired (* t)) (obtained (* t)) (allowed-changes sb-alien:int))
+(sb-alien:define-alien-routine ("SDL_CloseAudioDevice" %close-audio-device) sb-alien:void
+  (dev sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("SDL_PauseAudioDevice" %pause-audio-device) sb-alien:void
+  (dev sb-alien:unsigned-int) (pause sb-alien:int))
+(sb-alien:define-alien-routine ("SDL_QueueAudio" %queue-audio) sb-alien:int
+  (dev sb-alien:unsigned-int) (data (* t)) (len sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("SDL_GetQueuedAudioSize" %queued-audio-size)
+    sb-alien:unsigned-int
+  (dev sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("SDL_ClearQueuedAudio" %clear-queued-audio) sb-alien:void
+  (dev sb-alien:unsigned-int))
+
 (defconstant +init-video+ #x20)
 (defconstant +window-shown+ 4)
 (defconstant +window-resizable+ 32)

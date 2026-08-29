@@ -110,6 +110,7 @@
   ;; and it shrank a 1456-wide window to 1259 over a few rounds before this existed.
   (pending-w nil) (pending-h nil) (pending-frames 0)
   ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
+  (audio nil)                      ; the AUDIO-OUT playing this seat, or NIL
   (size-probe nil) (free-size-probe nil)
   ;; ...and the same in pixels.  Under ALLOW_HIGHDPI these differ by the display's scale.
   (pixel-probe nil) (free-pixel-probe nil)
@@ -457,7 +458,7 @@
 
   ;;; ---- the loop ----------------------------------------------------------------
 
-  (defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60))
+  (defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60) (audio t))
     "Open a window onto a glass desktop and pump it until closed.
 
      Runs on the calling thread and does not return until the window closes, which
@@ -566,7 +567,23 @@
                (setf (v-renderer v) (sdl (%create-renderer (v-window v) -1 0))))
              (make-texture v)
              ;; Only now: the watch can fire the moment it is registered, and it draws.
-             (setf *live-viewer* v)
+             ;; SOUND, for a seat whose mixer is in this image.  Only for :SEAT: a remote RFB
+           ;; desktop's audio arrives on its own socket and is that transport's business,
+           ;; while a welded desktop has no socket at all and the mix is simply here.
+           (when (and audio seat)
+             ;; THIS SEAT'S OWN MIX IF IT HAS ONE, otherwise the session's.  SEAT-MIX is a
+             ;; HEADSET's — audio addressed to one person, reading their selection aloud —
+             ;; and it is NIL on a seat with no headset, which is nearly every seat.  What a
+             ;; desktop sounds like is the session mix, which is what the audio socket serves
+             ;; to a remote listener and what a local one should hear for the same reason.
+             (let ((mix (or (let ((f (and (find-package "CLIM-GLASS")
+                                          (find-symbol "SEAT-MIX" "CLIM-GLASS"))))
+                              (and f (fboundp f) (ignore-errors (funcall f seat))))
+                            (let ((f (and (find-package "GLASS")
+                                          (find-symbol "SESSION-MIXER" "GLASS"))))
+                              (and f (fboundp f) (ignore-errors (funcall f)))))))
+               (setf (v-audio v) (start-audio mix))))
+           (setf *live-viewer* v)
              (%add-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                               (* t))
                                (null-ptr))
@@ -615,6 +632,7 @@
       (ignore-errors (funcall (src-stop (v-source v))))
       ;; Off FIRST, before anything it touches is destroyed — a watch firing against a
       ;; freed texture is a crash inside Cocoa, the worst place to have one.
+      (ignore-errors (stop-audio (v-audio v)))
       (%del-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                        (* t))
                         (null-ptr))
