@@ -40,7 +40,8 @@ recovers.")
   (device 0 :type (unsigned-byte 32))
   sink
   thread
-  (stop nil))
+  (stop nil)
+  (muted nil))
 
 (defun %audio-spec (freq channels samples)
   "A filled-in SDL_AudioSpec: 32 bytes, and the fields have to land where SDL expects them.
@@ -103,6 +104,12 @@ recovers.")
          (target (* *audio-target-ms* bytes-per-ms)))
     (loop until (ao-stop ao)
           do (handler-case
+                 (if (ao-muted ao)
+                     ;; MUTED: keep pulling and drop it on the floor.  Not "stop pulling" —
+                     ;; the sink is a cursor on a live mix and a cursor that stops moving
+                     ;; falls behind, so unmuting would play a backlog of whatever happened
+                     ;; while you were not listening.  The mix is not a recording.
+                     (progn (funcall next (ao-sink ao)) (sdl (%delay 10)))
                  (let ((queued (sdl (%queued-audio-size (ao-device ao)))))
                    (if (>= queued target)
                        (sdl (%delay 5))
@@ -121,7 +128,7 @@ recovers.")
                                (sb-sys:with-pinned-objects (octets)
                                  (sdl (%queue-audio (ao-device ao)
                                                     (sb-alien:sap-alien (sb-sys:vector-sap octets) (* t))
-                                                    (length octets)))))))))
+                                                    (length octets))))))))))
                ;; A pump that dies takes the sound with it and nothing else; say so once and
                ;; keep the desktop.
                (error (e)
@@ -141,3 +148,21 @@ recovers.")
     (ignore-errors (sdl (%close-audio-device (ao-device ao))))
     (setf (ao-device ao) 0))
   nil)
+
+
+(defun audio-out-muted-p (ao) (and ao (ao-muted ao)))
+
+(defun (setf audio-out-muted-p) (on ao)
+  "Silence the speakers without giving the device back.
+
+   Muting DROPS frames rather than stopping the pull, because a sink is a cursor on a live mix:
+   a cursor that stops moving falls behind, and unmuting would then play a backlog of whatever
+   happened while nobody was listening.  A mix is not a recording.
+
+   The queue is cleared too, so what is already handed to the device does not finish playing
+   after you asked for quiet — a mute with 120 ms of tail is a mute somebody has to press
+   twice."
+  (when ao
+    (setf (ao-muted ao) (and on t))
+    (when on (ignore-errors (sdl (%clear-queued-audio (ao-device ao))))))
+  (and ao (ao-muted ao)))

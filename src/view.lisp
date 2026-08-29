@@ -459,7 +459,26 @@
 
   ;;; ---- the loop ----------------------------------------------------------------
 
-  (defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60) (audio t))
+  (defvar *viewer* nil
+  "The viewer currently showing a desktop in this image, or NIL.
+
+   Kept so that things outside this file can reach its devices — muting the speakers or the
+   microphone, asking whether they are muted — without being handed a VIEWER they have no
+   other use for.  One, because a process has one window; the same reasoning SESSION-MIC uses
+   for one microphone.")
+
+(defun mute-speakers (&optional (on t))
+  "Silence this machine's speakers, or unsilence with NIL.  Returns the new state."
+  (and *viewer* (setf (audio-out-muted-p (v-audio *viewer*)) on)))
+
+(defun mute-microphone (&optional (on t))
+  "Mute this machine's microphone, or unmute with NIL.  Returns the new state."
+  (and *viewer* (setf (audio-in-muted-p (v-mic *viewer*)) on)))
+
+(defun speakers-muted-p () (and *viewer* (audio-out-muted-p (v-audio *viewer*))))
+(defun microphone-muted-p () (and *viewer* (audio-in-muted-p (v-mic *viewer*))))
+
+(defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60) (audio t))
     "Open a window onto a glass desktop and pump it until closed.
 
      Runs on the calling thread and does not return until the window closes, which
@@ -595,7 +614,7 @@
              ;; showing an attached-but-silent device is how a denied permission prompt becomes
              ;; visible instead of looking like a quiet room.
              (setf (v-mic v) (start-mic)))
-           (setf *live-viewer* v)
+           (setf *live-viewer* v *viewer* v)
              (%add-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                               (* t))
                                (null-ptr))
@@ -649,7 +668,7 @@
       (%del-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                        (* t))
                         (null-ptr))
-      (setf *live-viewer* nil)
+      (setf *live-viewer* nil *viewer* nil)
       (when (v-free-size-probe v)
         (ignore-errors (funcall (v-free-size-probe v)))
         (setf (v-free-size-probe v) nil (v-size-probe v) nil))

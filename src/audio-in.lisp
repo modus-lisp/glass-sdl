@@ -38,7 +38,8 @@ than an error.")
   (device 0 :type (unsigned-byte 32))
   mic
   thread
-  (stop nil))
+  (stop nil)
+  (muted nil))
 
 (defun start-mic (&key (rate *mic-rate*) (frame-ms *mic-frame-ms*) (name "local"))
   "Open this machine's microphone and attach it to the session.  Returns an AUDIO-IN, or NIL
@@ -104,9 +105,17 @@ than an error.")
                       ;; time to build a backlog we would then be chasing.
                       (sdl (%delay 5)))
                      (t
-                      (dotimes (i frame)
-                        (let ((v (logior (aref buf (* 2 i)) (ash (aref buf (1+ (* 2 i))) 8))))
-                          (setf (aref pcm i) (if (> v 32767) (- v 65536) v))))
+                      ;; MUTED PUSHES SILENCE rather than pushing nothing.  A microphone that
+                      ;; stops sending goes not-live, and the ear then falls back to the
+                      ;; session mix — so muting yourself would make the desktop start
+                      ;; transcribing its own audio, which is a surprising thing for a mute
+                      ;; button to do.  Silence keeps the source stable and the room quiet,
+                      ;; which is what was asked for.
+                      (if (ai-muted ai)
+                          (fill pcm 0)
+                          (dotimes (i frame)
+                            (let ((v (logior (aref buf (* 2 i)) (ash (aref buf (1+ (* 2 i))) 8))))
+                              (setf (aref pcm i) (if (> v 32767) (- v 65536) v)))))
                       (when push (funcall push (ai-mic ai) pcm)))))
                (error (e)
                  (format *error-output* "~&glass-sdl: microphone stopped — ~a~%" e)
@@ -124,3 +133,16 @@ than an error.")
     (ignore-errors (sdl (%close-audio-device (ai-device ai))))
     (setf (ai-device ai) 0))
   nil)
+
+
+(defun audio-in-muted-p (ai) (and ai (ai-muted ai)))
+
+(defun (setf audio-in-muted-p) (on ai)
+  "Mute the microphone without unplugging it.
+
+   See PUMP-MIC: muting pushes SILENCE rather than pushing nothing.  A microphone that stops
+   sending goes not-live, and the ear falls back to the session mix — so a mute button would
+   make the desktop begin transcribing its own audio, which is not what anybody means by mute.
+   The device stays open and the source stays stable; the room simply goes quiet."
+  (when ai (setf (ai-muted ai) (and on t)))
+  (and ai (ai-muted ai)))
