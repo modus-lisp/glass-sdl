@@ -110,6 +110,8 @@
   ;; and it shrank a 1456-wide window to 1259 over a few rounds before this existed.
   (pending-w nil) (pending-h nil) (pending-frames 0)
   ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
+  (title "glass")                  ; the window's name WITHOUT the device indicators
+  (devices-shown :none)            ; (MIC-LIVE SPEAKERS-LIVE) as last put in the title
   (audio nil)                      ; the AUDIO-OUT playing this seat, or NIL
   (mic nil)                        ; the AUDIO-IN feeding the session, or NIL
   (size-probe nil) (free-size-probe nil)
@@ -467,13 +469,36 @@
    other use for.  One, because a process has one window; the same reasoning SESSION-MIC uses
    for one microphone.")
 
+(defun refresh-title (v)
+  "Put the device state in the window's title.
+
+   THE ONE PIECE OF REAL CHROME THIS PROGRAM HAS.  A desktop's own title bars are pixels it
+   draws; the window title is the host's, so it is visible when the desktop is behind
+   something, in the window list, and in the switcher — which is where you look to ask \"is my
+   microphone open\" without first finding the window and opening a menu.
+
+   Present when ON and absent when off, rather than a pair of symbols that swap.  A muted
+   microphone should not put a microphone in the title: the question being asked is whether
+   something is live, and the honest answer to no is nothing at all.  It also keeps a session
+   whose devices are both quiet looking exactly like a session that has none, which is what it
+   is from the room's point of view."
+  (when (and v (v-window v))
+    (let* ((mic (and (v-mic v) (not (audio-in-muted-p (v-mic v)))))
+           (spk (and (v-audio v) (not (audio-out-muted-p (v-audio v)))))
+           (name (format nil "~a~@[ ~a~]~@[ ~a~]" (v-title v)
+                         (and spk (string (code-char #x1F50A)))     ; speaker with waves
+                         (and mic (string (code-char #x1F3A4))))))  ; microphone
+      (ignore-errors (sdl (%set-window-title (v-window v) name))))))
+
 (defun mute-speakers (&optional (on t))
   "Silence this machine's speakers, or unsilence with NIL.  Returns the new state."
-  (and *viewer* (setf (audio-out-muted-p (v-audio *viewer*)) on)))
+  (prog1 (and *viewer* (setf (audio-out-muted-p (v-audio *viewer*)) on))
+    (refresh-title *viewer*)))
 
 (defun mute-microphone (&optional (on t))
   "Mute this machine's microphone, or unmute with NIL.  Returns the new state."
-  (and *viewer* (setf (audio-in-muted-p (v-mic *viewer*)) on)))
+  (prog1 (and *viewer* (setf (audio-in-muted-p (v-mic *viewer*)) on))
+    (refresh-title *viewer*)))
 
 (defun speakers-muted-p () (and *viewer* (audio-out-muted-p (v-audio *viewer*))))
 (defun microphone-muted-p () (and *viewer* (audio-in-muted-p (v-mic *viewer*))))
@@ -596,6 +621,21 @@
              ;; SOUND, for a seat whose mixer is in this image.  Only for :SEAT: a remote RFB
            ;; desktop's audio arrives on its own socket and is that transport's business,
            ;; while a welded desktop has no socket at all and the mix is simply here.
+           ;; The name WITHOUT indicators, so REFRESH-TITLE has something to build on rather
+           ;; than having to parse emoji back out of a title it wrote.
+           (setf (v-title v)
+                 (or title
+                     (if seat
+                         (let ((n (find-symbol "SEAT-NAME" "CLIM-GLASS")))
+                           (format nil "glass — ~a"
+                                   (if (and (stringp glass:*desktop-name*)
+                                            (plusp (length glass:*desktop-name*))
+                                            (not (string= glass:*desktop-name* "glass")))
+                                       glass:*desktop-name*
+                                       (or (and n (fboundp n)
+                                                (ignore-errors (funcall n seat)))
+                                           "desktop"))))
+                         (format nil "glass — ~a:~d" host port))))
            (when (and audio seat)
              ;; THIS SEAT'S OWN MIX IF IT HAS ONE, otherwise the session's.  SEAT-MIX is a
              ;; HEADSET's — audio addressed to one person, reading their selection aloud —
@@ -613,7 +653,28 @@
              ;; it: what a microphone is for is not this file's business, and the Mixer window
              ;; showing an attached-but-silent device is how a denied permission prompt becomes
              ;; visible instead of looking like a quiet room.
-             (setf (v-mic v) (start-mic)))
+             ;; THE MICROPHONE IS OFFERED, NOT TAKEN.  Registering the ability rather than
+             ;; exercising it means the capture device — and on macOS the permission prompt
+             ;; that comes with it — happens the first time something asks to hear you, not
+             ;; because a desktop started.  GLASS:ENSURE-MIC calls this from the ear's first
+             ;; look for a microphone.
+             (let ((provider (and (find-package "GLASS")
+                                  (find-symbol "*MIC-PROVIDER*" "GLASS"))))
+               (when provider
+                 (setf (symbol-value provider)
+                       ;; NO WINDOW WORK HERE.  This runs on whatever thread first wanted a
+                       ;; microphone — the ear's, in practice — and NSWindow may only be
+                       ;; touched on the main thread; doing it here terminated the process
+                       ;; with an uncaught ObjC exception, which is not a condition anything
+                       ;; in Lisp can catch.  Opening the audio device off-thread is fine and
+                       ;; is all this does; the title catches up in the main loop, which is
+                       ;; where it is allowed to.
+                       (lambda ()
+                         (or (v-mic v)
+                             (let ((ai (start-mic)))
+                               (setf (v-mic v) ai)
+                               (and ai (ai-mic ai))))))))
+             (refresh-title v))
            (setf *live-viewer* v *viewer* v)
              (%add-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                               (* t))
@@ -653,6 +714,15 @@
                                               (max 1 (round (v-height v) sc)))))
                      (make-texture v))
                  (push-frame v))
+               ;; The title says which devices are live, and the devices can come and go on
+               ;; other threads — a microphone opens the first time something listens.  Only
+               ;; when it CHANGES: SDL_SetWindowTitle on every frame is a syscall per frame
+               ;; for a string that is almost always the same one.
+               (let ((now (list (and (v-mic v) (not (audio-in-muted-p (v-mic v))))
+                                (and (v-audio v) (not (audio-out-muted-p (v-audio v)))))))
+                 (unless (equal now (v-devices-shown v))
+                   (setf (v-devices-shown v) now)
+                   (refresh-title v)))
                (if (funcall (src-dirty-p r))
                    (push-frame v)
                    (sdl (%delay frame-ms)))

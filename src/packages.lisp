@@ -9,4 +9,5 @@
            #:start-mic #:stop-mic #:*mic-rate*
            ;; mute either direction without giving the device back
            #:audio-out-muted-p #:audio-in-muted-p
-           #:mute-speakers #:mute-microphone #:speakers-muted-p #:microphone-muted-p))
+           #:mute-speakers #:mute-microphone #:speakers-muted-p #:microphone-muted-p
+           #:refresh-title))
