@@ -34,12 +34,41 @@ than an error.")
 (defparameter *mic-frame-ms* 20
   "Milliseconds per frame handed to glass, matching the mixer's period and the socket path's.")
 
+(defparameter *mic-linger-seconds* 4
+  "Seconds the title keeps showing a microphone after the device has been given back.
+
+A MacBook's camera light stays on for a moment after capture stops, and that is not a delay
+in turning it off — it is the point.  An indicator that tracks the hardware exactly can be
+true for a tenth of a second, which is long enough to have recorded you and short enough that
+nobody sees it.  Lingering makes a brief capture impossible to miss.
+
+It errs the SAFE way: the title can claim a microphone is live slightly after it has stopped,
+and never the reverse.  Of the two possible lies that is the harmless one.")
+
+(defparameter *mic-idle-seconds* 5
+  "Seconds of nobody listening before the microphone is given back.
+
+The device is taken when something first asks to hear you; this is the other half of that
+bargain.  A microphone left open because a transcript was closed an hour ago is a recording
+light on for nothing, and on this platform it is also a device held away from every other
+program on the machine.
+
+Long enough to survive the gap between stopping one listener and starting another — turning
+dictation off to read what it typed and turning it back on should not cost a permission
+prompt — and short enough that closing the last thing that listens visibly ends it.  NIL keeps
+it open, for a caller who would rather hold the device than re-open it.")
+
 (defstruct (audio-in (:conc-name ai-))
   (device 0 :type (unsigned-byte 32))
   mic
   thread
   (stop nil)
-  (muted nil))
+  (muted nil)
+  ;; For the idle reaper: the consumer's frame count as last seen, and when it last moved.
+  (seen-frames -1 :type fixnum)
+  (seen-at 0 :type integer)
+  ;; ...and when the device was given back, so the indicator can outlive it by a moment.
+  (released-at 0 :type integer))
 
 (defun start-mic (&key (rate *mic-rate*) (frame-ms *mic-frame-ms*) (name "local"))
   "Open this machine's microphone and attach it to the session.  Returns an AUDIO-IN, or NIL
@@ -82,7 +111,8 @@ than an error.")
       nil)))
 
 (defun pump-mic (ai)
-  "Take whole frames off the capture queue and push them into the session's microphone.
+  "Take whole frames off the capture queue and push them into the session's microphone,
+   until nobody is taking them any more.
 
    WHOLE FRAMES ONLY.  A partial frame is not a small frame, it is a frame boundary in the
    wrong place, and every consumer downstream — the ear's window, the level gate — counts in
@@ -94,7 +124,13 @@ than an error.")
          (buf (make-array bytes :element-type '(unsigned-byte 8)))
          (pcm (make-array frame :element-type '(signed-byte 16))))
     (loop until (ai-stop ai)
-          do (handler-case
+          do (when (%idle-too-long-p ai)
+               ;; GIVE THE DEVICE BACK HERE, in this thread, rather than returning and leaving
+               ;; somebody else to notice.  STOP-MIC joins this thread, so it cannot be the one
+               ;; to do it; the teardown is the same minus the join.
+               (%release ai "nobody listening")
+               (return))
+             (handler-case
                  (let ((got (sb-sys:with-pinned-objects (buf)
                               (sdl (%dequeue-audio (ai-device ai)
                                                    (sb-alien:sap-alien (sb-sys:vector-sap buf) (* t))
@@ -120,6 +156,72 @@ than an error.")
                (error (e)
                  (format *error-output* "~&glass-sdl: microphone stopped — ~a~%" e)
                  (setf (ai-stop ai) t))))))
+
+(defun %release (ai why)
+  "Detach the microphone and give the capture device back, without joining anything.
+
+   THE INDICATOR HAS TO FOLLOW THE DEVICE, which is the whole reason this sets the device to
+   zero rather than just setting a flag.  A MacBook's camera light is wired to the camera's
+   power, so there is no state in which the camera is on and the light is not; the title here
+   should work the same way — AUDIO-IN-OPEN-P asks whether there is a device, so a microphone
+   that has been given back cannot leave a microphone in the title.  A separate `mic is on'
+   boolean would be a light with its own wiring, and the first bug in it would be exactly the
+   one worth preventing."
+  (let ((detach (and (find-package "GLASS") (find-symbol "DETACH-MIC" "GLASS"))))
+    (when (and detach (fboundp detach) (ai-mic ai))
+      (ignore-errors (funcall detach (ai-mic ai)))))
+  (ignore-errors (sdl (%pause-audio-device (ai-device ai) 1)))
+  (ignore-errors (sdl (%close-audio-device (ai-device ai))))
+  (setf (ai-device ai) 0 (ai-stop ai) t (ai-released-at ai) (get-internal-real-time))
+  (format *error-output* "~&glass-sdl: microphone released — ~a~%" why)
+  (finish-output *error-output*)
+  nil)
+
+(defun audio-in-open-p (ai)
+  "Whether this microphone actually holds a device right now.
+
+   Asked of the device and not of a flag, so nothing can be listening while the title says it
+   is not, or the reverse.  See %RELEASE."
+  (and ai (plusp (ai-device ai)) (not (ai-stop ai))))
+
+(defun audio-in-showing-p (ai)
+  "Whether the title should show a microphone: one is open, or one was open just now.
+
+   See *MIC-LINGER-SECONDS*.  AUDIO-IN-OPEN-P is the truth about the device and this is what
+   an indicator should say about it, which are deliberately not the same question — an
+   indicator that matched the hardware exactly could be true for a tenth of a second, which is
+   long enough to have heard you and too short to notice."
+  (and ai
+       (or (audio-in-open-p ai)
+           (and *mic-linger-seconds*
+                (plusp (ai-released-at ai))
+                (< (- (get-internal-real-time) (ai-released-at ai))
+                   (* *mic-linger-seconds* internal-time-units-per-second))))))
+
+(defun %idle-too-long-p (ai)
+  "True when nothing has taken a frame from this microphone for *MIC-IDLE-SECONDS*.
+
+   ASKED OF THE MICROPHONE, not of the ear.  MIC-FRAMES counts what has been handed to a
+   consumer, so a count that stops moving IS nobody listening — whoever the consumer was, and
+   whether it stopped politely or simply went away.  Asking the ear instead would mean this
+   file knowing what an ear is, and would still be wrong for every other thing that might read
+   a microphone."
+  (let ((limit *mic-idle-seconds*)
+        (mic (ai-mic ai)))
+    (when (and limit mic)
+      (let ((n (ignore-errors (funcall (find-symbol "MIC-FRAMES" "GLASS") mic)))
+            (now (get-internal-real-time)))
+        (cond ((null n) nil)
+              ;; moved, or first look: reset the clock and keep going
+              ((/= n (ai-seen-frames ai))
+               (setf (ai-seen-frames ai) n (ai-seen-at ai) now)
+               nil)
+              ;; never moved at all: time it from when we started watching, not from zero
+              ((zerop (ai-seen-at ai))
+               (setf (ai-seen-at ai) now)
+               nil)
+              (t (> (- now (ai-seen-at ai))
+                    (* limit internal-time-units-per-second))))))))
 
 (defun stop-mic (ai)
   "Stop capturing, detach the microphone, give the device back.  Safe on NIL."

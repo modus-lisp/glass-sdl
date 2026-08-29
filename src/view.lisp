@@ -483,7 +483,9 @@
    whose devices are both quiet looking exactly like a session that has none, which is what it
    is from the room's point of view."
   (when (and v (v-window v))
-    (let* ((mic (and (v-mic v) (not (audio-in-muted-p (v-mic v)))))
+    ;; SHOWING-P, not OPEN-P: the indicator outlives the device by a moment on purpose, so a
+    ;; brief capture cannot flash past.  See *MIC-LINGER-SECONDS*.
+    (let* ((mic (and (audio-in-showing-p (v-mic v)) (not (audio-in-muted-p (v-mic v)))))
            (spk (and (v-audio v) (not (audio-out-muted-p (v-audio v)))))
            (name (format nil "~a~@[ ~a~]~@[ ~a~]" (v-title v)
                          (and spk (string (code-char #x1F50A)))     ; speaker with waves
@@ -670,7 +672,11 @@
                        ;; is all this does; the title catches up in the main loop, which is
                        ;; where it is allowed to.
                        (lambda ()
-                         (or (v-mic v)
+                         ;; OPEN-P and not merely non-NIL: a microphone given back after going
+                         ;; idle leaves its AUDIO-IN behind, and asking for one again has to
+                         ;; open a device rather than hand back the closed one.
+                         (if (audio-in-open-p (v-mic v))
+                             (ai-mic (v-mic v))
                              (let ((ai (start-mic)))
                                (setf (v-mic v) ai)
                                (and ai (ai-mic ai))))))))
@@ -718,7 +724,8 @@
                ;; other threads — a microphone opens the first time something listens.  Only
                ;; when it CHANGES: SDL_SetWindowTitle on every frame is a syscall per frame
                ;; for a string that is almost always the same one.
-               (let ((now (list (and (v-mic v) (not (audio-in-muted-p (v-mic v))))
+               (let ((now (list (and (audio-in-showing-p (v-mic v))
+                                     (not (audio-in-muted-p (v-mic v))))
                                 (and (v-audio v) (not (audio-out-muted-p (v-audio v)))))))
                  (unless (equal now (v-devices-shown v))
                    (setf (v-devices-shown v) now)
