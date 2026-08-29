@@ -102,16 +102,30 @@
   (width 0) (height 0)
   (buttons 0)                      ; RFB button mask, held across motion events
   (last-x 0) (last-y 0)            ; a wheel event carries no position
-  (resized nil))
+  (resized nil)
+  ;; A size we ASKED the window for and have not been given yet.  %SET-WINDOW-SIZE does not
+  ;; take effect before it returns — the window server applies it on its own schedule — so
+  ;; without this, SETTLE-SIZE reads the stale size a moment later, concludes the desktop
+  ;; has drifted, and resizes the desktop back to it.  That is not hypothetical: it ratchets,
+  ;; and it shrank a 1456-wide window to 1259 over a few rounds before this existed.
+  (pending-w nil) (pending-h nil) (pending-frames 0))
 
 (defun window-points (v)
-  "The window's size in POINTS — the space mouse events arrive in."
-  (let ((w (sb-alien:make-alien sb-alien:int))
-        (h (sb-alien:make-alien sb-alien:int)))
-    (unwind-protect
-         (progn (%get-window-size (v-window v) w h)
-                (values (sb-alien:deref w) (sb-alien:deref h)))
-      (sb-alien:free-alien w) (sb-alien:free-alien h))))
+  "The window's size in POINTS — the space mouse events arrive in.
+
+   Measured, because this is now on two hot paths — every pointer event and every frame —
+   and cheap should be a number: 32 ns and 96 bytes per call, the latter from taking
+   ADDR of a local alien rather than from the two return values (a one-value variant
+   conses identically).  WITH-ALIEN over MAKE-ALIEN because it is still the right shape,
+   not because it made this free; it did not.
+
+   Both figures are noise here.  A frame is a four-megabyte texture upload, so the read is
+   0.0002% of a 60 Hz budget, and at a drag's event rate the garbage is tens of KB a second
+   of nursery that gen 0 sweeps without noticing.  It could be made truly free with two
+   cells owned by the viewer; that trade is not worth the lifetime it would introduce."
+  (sb-alien:with-alien ((w sb-alien:int) (h sb-alien:int))
+    (%get-window-size (v-window v) (sb-alien:addr w) (sb-alien:addr h))
+    (values w h)))
 
 (defun to-fb (v x y)
   "An SDL pointer position mapped into FRAMEBUFFER coordinates.
@@ -139,6 +153,53 @@
     (error "glass-sdl: could not create a ~dx~d texture: ~a"
            (v-width v) (v-height v) (sdl (%get-error)))))
 
+(defun settle-size (v)
+  "Make the desktop the size the window ACTUALLY is, if it has drifted.  True when it did
+   something, so the caller can skip a frame it is about to redraw anyway.
+
+   Called every frame, because events have proved not to be a complete account of this.  A
+   window is created at whatever size the system decided to grant and no SIZE_CHANGED
+   follows, since from the window's point of view nothing changed; the same silence applies
+   when %SET-WINDOW-SIZE is capped on the way out, which is the desktop-initiated half of
+   the identical bug.  Both were being caught in one specific place each.  Asking outright
+   catches those and whatever else behaves this way — a display reconfiguration, a
+   fullscreen toggle, a tiling window manager that simply has opinions.
+
+   THE WINDOW IS THE TRUTH, always in that direction, which is what keeps this from
+   fighting the resize path that pushes the other way.  When the desktop resizes itself the
+   loop asks the window to follow; if the request is granted the two agree and this does
+   nothing, and if it is capped this adopts what was actually given.  Either way it settles
+   in one step instead of leaving a scaled desktop nobody was told about.
+
+   Costs a struct read per frame — the render below is a four-megabyte texture upload."
+  (multiple-value-bind (gw gh) (window-points v)
+    ;; A REQUEST IN FLIGHT IS NOT A DRIFT.  While we are waiting to be given a size we asked
+    ;; for, the window still reads as whatever it was, and acting on that would undo the
+    ;; request — the desktop and the window would each keep answering the other's last word.
+    ;; Wait for the size to arrive (request granted, nothing to do) or for the grace to run
+    ;; out (request capped or refused, and then whatever we actually have is the truth).
+    (when (v-pending-w v)
+      (cond ((and (eql gw (v-pending-w v)) (eql gh (v-pending-h v)))
+             (setf (v-pending-w v) nil (v-pending-h v) nil))
+            ((plusp (v-pending-frames v))
+             (decf (v-pending-frames v))
+             (return-from settle-size nil))
+            (t (setf (v-pending-w v) nil (v-pending-h v) nil))))
+    (when (and (plusp gw) (plusp gh)
+               (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
+      (let ((r (v-source v)))
+        (funcall (src-want-size r) gw gh)
+        (let ((nw (funcall (src-width r))) (nh (funcall (src-height r))))
+          ;; Only when the source actually took the new size.  A remote desktop answers on
+          ;; its own schedule, and rebuilding the texture against a size it has not adopted
+          ;; would upload the old framebuffer at the new stride — a sheared picture, which
+          ;; is a worse failure than the scaling this exists to remove.
+          (when (and (eql nw gw) (eql nh gh)
+                     (not (and (eql nw (v-width v)) (eql nh (v-height v)))))
+            (setf (v-width v) nw (v-height v) nh)
+            (make-texture v)
+            t))))))
+
 (defun push-frame (v)
   "Upload the remote's framebuffer and present it.
 
@@ -146,6 +207,9 @@
    flag rather than a rectangle list, so there is nothing finer to act on, and a
    1280x800 upload is four megabytes of memcpy that a GPU eats without noticing.
    Idle costs nothing because we only get here when the flag was set."
+  ;; Before the fb is read, so a size settled here is reflected by this very frame rather
+  ;; than by the next one.
+  (settle-size v)
   (let* ((fb (funcall (src-fb (v-source v))))
          (px (glass:fb-pixels fb)))
     (sb-sys:with-pinned-objects (px)
@@ -294,19 +358,10 @@
                                       (logior +window-shown+ +window-resizable+))))
            (when (sb-alien:null-alien (v-window v))
              (error "glass-sdl: could not open a window: ~a" (sdl (%get-error))))
-           ;; WHAT WE WERE ACTUALLY GIVEN, which is not always what we asked for and is not
-           ;; announced.  macOS caps a window between the menu bar and the Dock; an X11 window
-           ;; manager applies its own constraints; a tiling one ignores the request outright.
-           ;; In every case the window is CREATED at the constrained size, so there is no change
-           ;; to report and no SIZE-CHANGED arrives — measured: asking for 1600x1000 here yields
-           ;; 1456x921 and exactly zero window events.  That silence is why the resize handler
-           ;; below, which has always been correct for a later change, never saw this one.
-           ;;
-           ;; Measured rather than predicted.  SDL_GetDisplayUsableBounds can only answer for
-           ;; platforms that expose a work area — X11 reads _NET_WORKAREA, Wayland has no such
-           ;; concept and returns the whole display — so a prediction is right on one platform
-           ;; and quietly wrong elsewhere.  Asking the window is right on all of them, and more
-           ;; accurate even here: the guess gave up 40x32 pixels the window server never took.
+           ;; The same settling SETTLE-SIZE does every frame, done once here because the
+           ;; texture below should be created at the right size rather than made, replaced
+           ;; and thrown away on the first frame.  See SETTLE-SIZE for why a window's
+           ;; granted size has to be asked for rather than waited for.
            (multiple-value-bind (gw gh) (window-points v)
              (when (and (plusp gw) (plusp gh)
                         (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
@@ -330,6 +385,10 @@
                  (setf (v-resized v) nil
                        (v-width v) (funcall (src-width r))
                        (v-height v) (funcall (src-height r)))
+                 ;; Asked for, not yet granted — see the PENDING slots.  Half a second of
+                 ;; grace at 60 Hz, after which whatever the window actually is wins.
+                 (setf (v-pending-w v) (v-width v) (v-pending-h v) (v-height v)
+                       (v-pending-frames v) 30)
                  (sdl (%set-window-size (v-window v) (v-width v) (v-height v)))
                  (make-texture v)
                  (push-frame v))
