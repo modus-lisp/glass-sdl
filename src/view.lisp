@@ -104,6 +104,56 @@
   (last-x 0) (last-y 0)            ; a wheel event carries no position
   (resized nil))
 
+(defun usable-size (want-w want-h)
+  "WANT-W x WANT-H clamped to the part of the display a window can actually occupy.
+
+   macOS does not refuse an oversized window, it SILENTLY CAPS it between the menu bar and
+   the Dock — so asking for 1600x1000 on a screen with 1600x1000 of glass gets a window
+   some tens of pixels shorter, and every symptom after that is a consequence of the
+   framebuffer and the window no longer being the same size: SDL stretches the texture, and
+   the pointer arithmetic below has a scale to undo.  Asking for a size that fits means the
+   common case is 1:1 and no scaling happens at all.
+
+   A margin comes off as well.  Usable bounds are exact, and a window at exactly that size
+   has its title bar flush against the menu bar with nowhere to grab it."
+  (let ((rect (sb-alien:make-alien sb-alien:int 4)))
+    (unwind-protect
+         (if (zerop (%get-display-usable-bounds 0 (sb-alien:cast rect (* t))))
+             (let ((max-w (- (sb-alien:deref rect 2) 40))
+                   (max-h (- (sb-alien:deref rect 3) 60)))
+               (values (max 320 (min want-w max-w))
+                       (max 240 (min want-h max-h))))
+             ;; No answer (a headless display index, an SDL that does not implement it):
+             ;; ask for what was wanted.  Being capped is the thing this avoids, not a
+             ;; thing it must prevent.
+             (values want-w want-h))
+      (sb-alien:free-alien rect))))
+
+(defun window-points (v)
+  "The window's size in POINTS — the space mouse events arrive in."
+  (let ((w (sb-alien:make-alien sb-alien:int))
+        (h (sb-alien:make-alien sb-alien:int)))
+    (unwind-protect
+         (progn (%get-window-size (v-window v) w h)
+                (values (sb-alien:deref w) (sb-alien:deref h)))
+      (sb-alien:free-alien w) (sb-alien:free-alien h))))
+
+(defun to-fb (v x y)
+  "An SDL pointer position mapped into FRAMEBUFFER coordinates.
+
+   RENDER-COPY stretches the whole texture over the whole window, so when the two are not
+   the same size a click lands somewhere the pointer is not — increasingly wrong toward the
+   bottom right, which is what an offset cursor over a scaled desktop is.  The same ratio
+   that scales the pixels has to scale the input back.
+
+   Identity in the normal case, and cheap enough not to be worth avoiding when it is not."
+  (multiple-value-bind (ww wh) (window-points v)
+    (if (or (zerop ww) (zerop wh)
+            (and (eql ww (v-width v)) (eql wh (v-height v))))
+        (values x y)
+        (values (min (1- (v-width v))  (max 0 (floor (* x (v-width v))  ww)))
+                (min (1- (v-height v)) (max 0 (floor (* y (v-height v)) wh)))))))
+
 (defun make-texture (v)
   "A streaming texture the size of the remote's screen."
   (when (v-texture v) (sdl (%destroy-texture (v-texture v))))
@@ -168,17 +218,21 @@
        t)
 
       ((= type +mouse-motion+)
-       (setf (v-last-x v) (ev-i32 sap 20) (v-last-y v) (ev-i32 sap 24))
+       (multiple-value-bind (fx fy) (to-fb v (ev-i32 sap 20) (ev-i32 sap 24))
+         (setf (v-last-x v) fx (v-last-y v) fy))
        (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v))
        t)
 
       ((or (= type +mouse-button-down+) (= type +mouse-button-up+))
        (let ((bit (button-bit (ev-u8 sap 16))))
-         (setf (v-last-x v) (ev-i32 sap 20) (v-last-y v) (ev-i32 sap 24))
+         (multiple-value-bind (fx fy) (to-fb v (ev-i32 sap 20) (ev-i32 sap 24))
+           (setf (v-last-x v) fx (v-last-y v) fy))
          (setf (v-buttons v) (if (= type +mouse-button-down+)
                                  (logior (v-buttons v) bit)
                                  (logandc2 (v-buttons v) bit)))
-         (funcall (src-pointer r) (v-buttons v) (ev-i32 sap 20) (ev-i32 sap 24)))
+           ;; The MAPPED position, not the raw one: storing the mapping and then sending
+           ;; the event's own coordinates is how a click misses what the cursor is over.
+           (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v)))
        t)
 
       ((= type +mouse-wheel+)
@@ -232,6 +286,25 @@
              (error "glass-sdl: no answer from ~a:~d" host port))
            (setf (v-width v) (funcall (src-width r))
                  (v-height v) (funcall (src-height r)))
+           ;; SMOOTH RATHER THAN BLOCKY when the window and the framebuffer are not the same
+           ;; size — mid-drag, or a desktop that is a fixed size on purpose.  SDL's default is
+           ;; "0", nearest neighbour, which is the hard staircase on every glyph of a scaled
+           ;; desktop.  Set BEFORE the texture exists: SDL reads this when a texture is made,
+           ;; not when one is drawn, so setting it afterwards is a setting that does nothing.
+           (%set-hint "SDL_RENDER_SCALE_QUALITY" "linear")
+           ;; ...AND MAKE 1:1 THE NORMAL CASE, which beats scaling well.  macOS does not refuse
+           ;; an oversized window, it silently caps it between the menu bar and the Dock — so a
+           ;; desktop asked to be taller than the screen becomes a permanently scaled one, with
+           ;; no event to say so.  Ask the DESKTOP for a size that fits before opening a window
+           ;; onto it.  For a local seat WANT-SIZE is the seat's own resize and has already
+           ;; happened by the time it returns, so the window is created at the settled size; for
+           ;; a remote one the request is in flight and the existing SIZE-CHANGED path converges,
+           ;; exactly as it does for a drag.
+           (multiple-value-bind (uw uh) (usable-size (v-width v) (v-height v))
+             (unless (and (eql uw (v-width v)) (eql uh (v-height v)))
+               (funcall (src-want-size r) uw uh)
+               (setf (v-width v) (funcall (src-width r))
+                     (v-height v) (funcall (src-height r)))))
            (funcall (src-on-resize r)
                     (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
            (setf (v-window v)

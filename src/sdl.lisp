@@ -53,6 +53,19 @@
 (sb-alien:define-alien-routine ("SDL_Init" %init) sb-alien:int (flags sb-alien:unsigned-int))
 (sb-alien:define-alien-routine ("SDL_Quit" %quit) sb-alien:void)
 (sb-alien:define-alien-routine ("SDL_GetError" %get-error) sb-alien:c-string)
+;; Hints must be set BEFORE the object they affect is created — SDL reads
+;; RENDER_SCALE_QUALITY when the texture is made, not when it is drawn.
+(sb-alien:define-alien-routine ("SDL_SetHint" %set-hint) sb-alien:int
+  (name sb-alien:c-string) (value sb-alien:c-string))
+;; The desktop MINUS the menu bar and the Dock, which is the part a window can
+;; actually occupy.  SDL_Rect is four Sint32: x, y, w, h.
+(sb-alien:define-alien-routine ("SDL_GetDisplayUsableBounds" %get-display-usable-bounds)
+    sb-alien:int
+  (display sb-alien:int) (rect (* t)))
+;; In POINTS, which is the same space mouse events arrive in — deliberately not the
+;; drawable size, which on a Retina panel is twice this.
+(sb-alien:define-alien-routine ("SDL_GetWindowSize" %get-window-size) sb-alien:void
+  (window (* t)) (w (* sb-alien:int)) (h (* sb-alien:int)))
 (sb-alien:define-alien-routine ("SDL_CreateWindow" %create-window) (* t)
   (title sb-alien:c-string) (x sb-alien:int) (y sb-alien:int)
   (w sb-alien:int) (h sb-alien:int) (flags sb-alien:unsigned-int))
