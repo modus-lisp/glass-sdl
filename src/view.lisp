@@ -111,9 +111,27 @@
   (pending-w nil) (pending-h nil) (pending-frames 0)
   ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
   (size-probe nil) (free-size-probe nil)
+  ;; ...and the same in pixels.  Under ALLOW_HIGHDPI these differ by the display's scale.
+  (pixel-probe nil) (free-pixel-probe nil)
   ;; What the last live-resize draw cost, and when it finished — the two numbers the watch
   ;; needs to decide whether it can afford another.  See the watch for the policy.
   (last-draw-ms 0.0) (last-draw-at 0))
+
+(defun make-pixel-probe (window)
+  "The window's size in PIXELS, as a closure over its own out-cells — the same shape and
+   the same reason as MAKE-SIZE-PROBE, which answers in points.
+
+   THE TWO ARE NOT THE SAME NUMBER once ALLOW_HIGHDPI is set, and everything downstream
+   turns on which one it wants.  The framebuffer is pixels: making it the drawable size is
+   what renders the desktop at the panel's real resolution instead of having the window
+   server upscale a half-resolution picture.  Mouse events are points, so the pointer keeps
+   asking the other probe.  Their ratio is the seat's density."
+  (let ((w (sb-alien:make-alien sb-alien:int))
+        (h (sb-alien:make-alien sb-alien:int)))
+    (values (lambda ()
+              (%get-window-pixels window w h)
+              (values (sb-alien:deref w) (sb-alien:deref h)))
+            (lambda () (sb-alien:free-alien w) (sb-alien:free-alien h)))))
 
 (defun make-size-probe (window)
   "Two out-cells for SDL_GetWindowSize and a closure that reads them, plus the thunk that
@@ -142,6 +160,21 @@
               (values (sb-alien:deref w) (sb-alien:deref h)))
             (lambda () (sb-alien:free-alien w) (sb-alien:free-alien h)))))
 
+(defun window-pixels (v)
+  "The window's size in PIXELS — what the framebuffer should be, so the desktop is drawn at
+   the panel's resolution rather than upscaled to it."
+  (funcall (v-pixel-probe v)))
+
+(defun window-scale (v)
+  "Pixels per point for this window: 2 on a Retina panel, 1 on an ordinary one, and 3/2 or
+   similar under fractional scaling.  Rational on purpose — this is what a seat's density
+   is set from, and rounding it here would throw away the fractional case at the one point
+   where it is still exact."
+  (multiple-value-bind (pw ph) (window-pixels v)
+    (multiple-value-bind (lw lh) (window-points v)
+      (declare (ignore ph lh))
+      (if (and (plusp lw) (plusp pw)) (/ pw lw) 1))))
+
 (defun window-points (v)
   "The window's size in POINTS — the space mouse events arrive in.
 
@@ -163,6 +196,11 @@
     (if (or (zerop ww) (zerop wh)
             (and (eql ww (v-width v)) (eql wh (v-height v))))
         (values x y)
+        ;; POINTS in, PIXELS out.  With ALLOW_HIGHDPI these differ by the display's scale
+        ;; even when nothing is being stretched, so on a 2x panel this is no longer an
+        ;; identity in the ordinary case — it is the conversion that keeps the cursor on
+        ;; what it is pointing at.  The arithmetic is the same either way: the ratio the
+        ;; picture was scaled by is the ratio the input must be scaled by.
         (values (min (1- (v-width v))  (max 0 (floor (* x (v-width v))  ww)))
                 (min (1- (v-height v)) (max 0 (floor (* y (v-height v)) wh)))))))
 
@@ -195,7 +233,11 @@
    in one step instead of leaving a scaled desktop nobody was told about.
 
    Costs a struct read per frame — the render below is a four-megabyte texture upload."
-  (multiple-value-bind (gw gh) (window-points v)
+  (multiple-value-bind (gw gh) (window-pixels v)
+    ;; PIXELS, not points: the framebuffer is the drawable, so that is the number it has to
+    ;; agree with.  Comparing against points would leave a 2x window permanently "drifted"
+    ;; by exactly the scale factor and resize the desktop every single frame.
+    ;;
     ;; A REQUEST IN FLIGHT IS NOT A DRIFT.  While we are waiting to be given a size we asked
     ;; for, the window still reads as whatever it was, and acting on that would undo the
     ;; request — the desktop and the window would each keep answering the other's last word.
@@ -449,22 +491,41 @@
                                                 (format nil "glass — ~a:~d" host port)))
                                         #x1FFF0000 #x1FFF0000
                                         (v-width v) (v-height v)
-                                        (logior +window-shown+ +window-resizable+))))
+                                        (logior +window-shown+ +window-resizable+
+                                                ;; Ask for the panel's real pixels.  Without this macOS gives a
+                                                ;; 1x backing store and the window server upscales it -- we pay
+                                                ;; for a Retina display and decline to use it.
+                                                +window-allow-highdpi+))))
              (when (sb-alien:null-alien (v-window v))
                (error "glass-sdl: could not open a window: ~a" (sdl (%get-error))))
              ;; Before anything asks the window its size, which the very next form does.
              (multiple-value-bind (probe free) (make-size-probe (v-window v))
                (setf (v-size-probe v) probe (v-free-size-probe v) free))
+             (multiple-value-bind (probe free) (make-pixel-probe (v-window v))
+               (setf (v-pixel-probe v) probe (v-free-pixel-probe v) free))
              ;; The same settling SETTLE-SIZE does every frame, done once here because the
              ;; texture below should be created at the right size rather than made, replaced
              ;; and thrown away on the first frame.  See SETTLE-SIZE for why a window's
              ;; granted size has to be asked for rather than waited for.
-             (multiple-value-bind (gw gh) (window-points v)
+             (multiple-value-bind (gw gh) (window-pixels v)
                (when (and (plusp gw) (plusp gh)
                           (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
                  (funcall (src-want-size r) gw gh)
                  (setf (v-width v) (funcall (src-width r))
                        (v-height v) (funcall (src-height r)))))
+             ;; THE SEAT LEARNS ITS DENSITY, which is the point of the whole exercise.  The
+             ;; desktop now has as many pixels as the panel does, and the seat knows each one
+             ;; is half the size it used to assume — so text scaled through SEAT-PPEM comes
+             ;; out sharp rather than small.  On an ordinary display the ratio is 1 and this
+             ;; is the identity, so nothing moves for anyone without the pixels to spare.
+             ;;
+             ;; By name: glass-sdl must not depend on the window-manager layer in order to be
+             ;; a viewer, which is the rule the rest of this file already follows.
+             (let ((setter (and seat (find-package "CLIM-GLASS")
+                                     (find-symbol "SEAT-SCALE" "CLIM-GLASS"))))
+               (when (and setter (fboundp (list 'setf setter)))
+                 (ignore-errors
+                   (funcall (fdefinition (list 'setf setter)) (window-scale v) seat))))
              (setf (v-renderer v)
                    (sdl (%create-renderer (v-window v) -1
                                           (logior +renderer-accelerated+ +renderer-presentvsync+))))
@@ -497,9 +558,19 @@
                            (v-height v) (funcall (src-height r)))
                      ;; Asked for, not yet granted — see the PENDING slots.  Half a second of
                      ;; grace at 60 Hz, after which whatever the window actually is wins.
+                     ;;
+                     ;; PENDING is in PIXELS because that is what SETTLE-SIZE compares against, but
+                     ;; %SET-WINDOW-SIZE is told POINTS — it sizes the window, not the drawable.
+                     ;; Handing it pixels on a 2x panel asks for a window twice the size of the
+                     ;; desktop, which is then capped, which then reads as a drift.  The scale is
+                     ;; read live rather than cached: dragging a window between a Retina panel and
+                     ;; an external monitor changes it.
                      (setf (v-pending-w v) (v-width v) (v-pending-h v) (v-height v)
                            (v-pending-frames v) 30)
-                     (sdl (%set-window-size (v-window v) (v-width v) (v-height v)))
+                     (let ((sc (window-scale v)))
+                       (sdl (%set-window-size (v-window v)
+                                              (max 1 (round (v-width v) sc))
+                                              (max 1 (round (v-height v) sc)))))
                      (make-texture v))
                  (push-frame v))
                (if (funcall (src-dirty-p r))
@@ -519,6 +590,9 @@
       (when (v-free-size-probe v)
         (ignore-errors (funcall (v-free-size-probe v)))
         (setf (v-free-size-probe v) nil (v-size-probe v) nil))
+      (when (v-free-pixel-probe v)
+        (ignore-errors (funcall (v-free-pixel-probe v)))
+        (setf (v-free-pixel-probe v) nil (v-pixel-probe v) nil))
       (when (v-texture v) (ignore-errors (sdl (%destroy-texture (v-texture v)))))
       (when (v-renderer v) (ignore-errors (sdl (%destroy-renderer (v-renderer v)))))
       (when (v-window v) (ignore-errors (sdl (%destroy-window (v-window v)))))

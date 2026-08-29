@@ -61,6 +61,10 @@
 ;; drawable size, which on a Retina panel is twice this.
 (sb-alien:define-alien-routine ("SDL_GetWindowSize" %get-window-size) sb-alien:void
   (window (* t)) (w (* sb-alien:int)) (h (* sb-alien:int)))
+;; ...and in PIXELS, which is a different number under ALLOW_HIGHDPI and the same one
+;; without it.  The framebuffer wants this; the mouse wants the one above.
+(sb-alien:define-alien-routine ("SDL_GetWindowSizeInPixels" %get-window-pixels) sb-alien:void
+  (window (* t)) (w (* sb-alien:int)) (h (* sb-alien:int)))
 (sb-alien:define-alien-routine ("SDL_CreateWindow" %create-window) (* t)
   (title sb-alien:c-string) (x sb-alien:int) (y sb-alien:int)
   (w sb-alien:int) (h sb-alien:int) (flags sb-alien:unsigned-int))
@@ -97,6 +101,11 @@
 (defconstant +init-video+ #x20)
 (defconstant +window-shown+ 4)
 (defconstant +window-resizable+ 32)
+;; SDL_WINDOW_ALLOW_HIGHDPI.  Without it macOS gives a 1x backing store and the window
+;; server upscales it to the panel — we pay for a Retina display and decline to use it.
+;; With it, the window's size in POINTS and its size in PIXELS come apart, and every place
+;; that conflated them has to pick one on purpose.  See VIEW.
+(defconstant +window-allow-highdpi+ 8192)
 ;; SDL_PIXELFORMAT_RGB888 is X8R8G8B8 — the alpha byte is ignored, which is
 ;; exactly right for glass's 0x00RRGGBB pixels.
 (defconstant +format-rgb888+ #x16161804)
