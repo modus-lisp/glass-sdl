@@ -117,6 +117,38 @@
   ;; needs to decide whether it can afford another.  See the watch for the policy.
   (last-draw-ms 0.0) (last-draw-at 0))
 
+(defun display-scale ()
+  "This display's pixels per point, measured — 2 on a Retina panel, 1 otherwise.
+
+   ASKED BEFORE A SESSION EXISTS, which is the whole reason it is here.  A viewer learns
+   the density when it opens its window, and by then the desktop has already been built and
+   its apps already spawned at whatever ppem they were given — so a terminal started at
+   session boot came out at 1x and stayed there, sharp chrome around small text.  Answering
+   the question early lets the session be MADE at the right density instead of corrected
+   afterwards, which would mean re-rendering every window that already exists.
+
+   Measured with a real window rather than SDL_GetDisplayDPI, which on macOS reports the
+   panel's physical DPI and not the backing-store ratio the window server actually applies —
+   a different number, and the wrong one.  The window is 1x1, never shown, and destroyed
+   before returning.  Falls back to 1 if anything about that fails: a viewer that cannot
+   measure should render exactly as it always did."
+  (handler-case
+      (progn
+        (load-sdl)
+        (sdl (%init +init-video+))
+        (let ((w (sdl (%create-window "probe" 0 0 1 1
+                                      (logior +window-hidden+ +window-allow-highdpi+)))))
+          (if (sb-alien:null-alien w)
+              1
+              (unwind-protect
+                   (sb-alien:with-alien ((pw sb-alien:int) (ph sb-alien:int)
+                                         (lw sb-alien:int) (lh sb-alien:int))
+                     (%get-window-pixels w (sb-alien:addr pw) (sb-alien:addr ph))
+                     (%get-window-size   w (sb-alien:addr lw) (sb-alien:addr lh))
+                     (if (and (plusp lw) (plusp pw)) (/ pw lw) 1))
+                (sdl (%destroy-window w))))))
+    (error () 1)))
+
 (defun make-pixel-probe (window)
   "The window's size in PIXELS, as a closure over its own out-cells — the same shape and
    the same reason as MAKE-SIZE-PROBE, which answers in points.

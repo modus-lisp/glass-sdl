@@ -105,6 +105,7 @@
 ;; server upscales it to the panel — we pay for a Retina display and decline to use it.
 ;; With it, the window's size in POINTS and its size in PIXELS come apart, and every place
 ;; that conflated them has to pick one on purpose.  See VIEW.
+(defconstant +window-hidden+ 8)
 (defconstant +window-allow-highdpi+ 8192)
 ;; SDL_PIXELFORMAT_RGB888 is X8R8G8B8 — the alpha byte is ignored, which is
 ;; exactly right for glass's 0x00RRGGBB pixels.

@@ -2,4 +2,4 @@
 
 (defpackage #:glass-sdl
   (:use #:cl)
-  (:export #:view #:*sdl-candidates* #:load-sdl))
+  (:export #:view #:*sdl-candidates* #:load-sdl #:display-scale))
