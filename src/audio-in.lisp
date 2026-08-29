@@ -68,9 +68,13 @@ it open, for a caller who would rather hold the device than re-open it.")
   (seen-frames -1 :type fixnum)
   (seen-at 0 :type integer)
   ;; ...and when the device was given back, so the indicator can outlive it by a moment.
-  (released-at 0 :type integer))
+  (released-at 0 :type integer)
+  ;; Per-device, so one viewer can hold a microphone open while another lets it go: NIL means
+  ;; hold it, which is what --mic=on asks for.
+  (idle-seconds *mic-idle-seconds*))
 
-(defun start-mic (&key (rate *mic-rate*) (frame-ms *mic-frame-ms*) (name "local"))
+(defun start-mic (&key (rate *mic-rate*) (frame-ms *mic-frame-ms*) (name "local")
+                       (idle *mic-idle-seconds*))
   "Open this machine's microphone and attach it to the session.  Returns an AUDIO-IN, or NIL
    if there is no capture device or glass has no microphone object in this image.
 
@@ -100,7 +104,7 @@ it open, for a caller who would rather hold the device than re-open it.")
             (return-from start-mic nil))
           (let* ((mic (funcall make :name name :wire-rate rate :rate rate
                                     :wire-frame frame :frame-samples frame))
-                 (ai (make-audio-in :device dev :mic mic)))
+                 (ai (make-audio-in :device dev :mic mic :idle-seconds idle)))
             (funcall attach mic)
             (sdl (%pause-audio-device dev 0))          ; 0 = start capturing
             (setf (ai-thread ai)
@@ -206,7 +210,7 @@ it open, for a caller who would rather hold the device than re-open it.")
    whether it stopped politely or simply went away.  Asking the ear instead would mean this
    file knowing what an ear is, and would still be wrong for every other thing that might read
    a microphone."
-  (let ((limit *mic-idle-seconds*)
+  (let ((limit (ai-idle-seconds ai))
         (mic (ai-mic ai)))
     (when (and limit mic)
       (let ((n (ignore-errors (funcall (find-symbol "MIC-FRAMES" "GLASS") mic)))

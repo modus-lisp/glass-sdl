@@ -505,7 +505,8 @@
 (defun speakers-muted-p () (and *viewer* (audio-out-muted-p (v-audio *viewer*))))
 (defun microphone-muted-p () (and *viewer* (audio-in-muted-p (v-mic *viewer*))))
 
-(defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60) (audio t))
+(defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60) (audio t)
+                  (mic :auto))
     "Open a window onto a glass desktop and pump it until closed.
 
      Runs on the calling thread and does not return until the window closes, which
@@ -655,15 +656,25 @@
              ;; it: what a microphone is for is not this file's business, and the Mixer window
              ;; showing an attached-but-silent device is how a denied permission prompt becomes
              ;; visible instead of looking like a quiet room.
-             ;; THE MICROPHONE IS OFFERED, NOT TAKEN.  Registering the ability rather than
-             ;; exercising it means the capture device — and on macOS the permission prompt
-             ;; that comes with it — happens the first time something asks to hear you, not
-             ;; because a desktop started.  GLASS:ENSURE-MIC calls this from the ear's first
-             ;; look for a microphone.
-             (let ((provider (and (find-package "GLASS")
-                                  (find-symbol "*MIC-PROVIDER*" "GLASS"))))
-               (when provider
-                 (setf (symbol-value provider)
+             ;; THE MICROPHONE, IN ONE OF THREE POSTURES.
+             ;;
+             ;;   :OFF    no provider, no device, ever.  Something that listens hears the
+             ;;           session mix, which is what a desktop with no microphone sounds like
+             ;;           and is a true answer rather than a broken one.
+             ;;   :AUTO   the ability is registered and the device is taken the first time
+             ;;           something asks to be heard, then given back when nobody is taking
+             ;;           frames.  The permission prompt happens because you asked to be
+             ;;           heard, not because a desktop started.
+             ;;   :ON     taken now and held.  For a session whose whole purpose is listening,
+             ;;           where re-opening on every gap is worse than holding it.
+             ;;
+             ;; :OFF registers nothing rather than registering a provider that refuses, so
+             ;; GLASS:ENSURE-MIC's answer is the honest "nothing here can open one".
+             (when (member mic '(:on :auto))
+               (let ((provider (and (find-package "GLASS")
+                                    (find-symbol "*MIC-PROVIDER*" "GLASS"))))
+                 (when provider
+                   (setf (symbol-value provider)
                        ;; NO WINDOW WORK HERE.  This runs on whatever thread first wanted a
                        ;; microphone — the ear's, in practice — and NSWindow may only be
                        ;; touched on the main thread; doing it here terminated the process
@@ -677,9 +688,15 @@
                          ;; open a device rather than hand back the closed one.
                          (if (audio-in-open-p (v-mic v))
                              (ai-mic (v-mic v))
-                             (let ((ai (start-mic)))
+                             (let ((ai (start-mic :idle (when (eq mic :auto)
+                                                          *mic-idle-seconds*))))
                                (setf (v-mic v) ai)
-                               (and ai (ai-mic ai))))))))
+                               (and ai (ai-mic ai)))))))
+               ;; :ON takes it now, through the same provider, so there is one path that opens
+               ;; a microphone and one place that decides how long it is held.
+               (when (eq mic :on)
+                 (let ((f (and (find-package "GLASS") (find-symbol "ENSURE-MIC" "GLASS"))))
+                   (when (and f (fboundp f)) (ignore-errors (funcall f)))))))
              (refresh-title v))
            (setf *live-viewer* v *viewer* v)
              (%add-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
