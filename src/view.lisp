@@ -220,200 +220,258 @@
             (make-texture v)
             t))))))
 
-(defun push-frame (v)
-  "Upload the remote's framebuffer and present it.
+(defvar *live-viewer* nil
+  "The viewer the live-resize watch should redraw, or NIL when no window is being viewed.
 
-   The whole screen, not the damaged part: glass/client reports dirtiness as a
-   flag rather than a rectangle list, so there is nothing finer to act on, and a
-   1280x800 upload is four megabytes of memcpy that a GPU eats without noticing.
-   Idle costs nothing because we only get here when the flag was set."
-  ;; Before the fb is read, so a size settled here is reflected by this very frame rather
-  ;; than by the next one.
-  (settle-size v)
-  (let* ((fb (funcall (src-fb (v-source v))))
-         (px (glass:fb-pixels fb)))
-    (sb-sys:with-pinned-objects (px)
-      (sdl (%update-texture (v-texture v) (null-ptr)
-                            (sb-alien:sap-alien (sb-sys:vector-sap px) (* t))
-                            (* 4 (v-width v)))))
-    (sdl (%render-clear (v-renderer v)))
-    (sdl (%render-copy (v-renderer v) (v-texture v) (null-ptr) (null-ptr)))
-    (sdl (%render-present (v-renderer v)))))
+   A special rather than the watch's USERDATA because a Lisp object cannot be handed to C
+   as a void* and got back without a registry, and there is one viewer per process here.")
 
-;;; ---- input -------------------------------------------------------------------
+(defvar *in-live-draw* nil
+  "Guard against re-entering the watch from inside its own redraw: presenting a frame can
+   pump events, and a watch that renders from within a render is a stack overflow with a
+   confusing backtrace.")
 
-(defun button-bit (sdl-button)
-  "SDL numbers buttons 1/2/3; RFB carries them as a bitmask."
-  (case sdl-button (1 1) (2 2) (3 4) (t 0)))
+(sb-alien:define-alien-callable live-resize-watch sb-alien:int
+    ((userdata (* t)) (event (* t)))
+  "Draw while the window is being dragged, which the main loop cannot do.
 
-(defun handle-event (v sap)
-  "Translate one SDL event and forward it.  Returns NIL to stop the viewer."
-  (let ((type (ev-u32 sap 0))
-        (r (v-source v)))
-    (cond
-      ((= type +quit+) nil)
+   THE MECHANIC, since it is not obvious and is entirely Cocoa's.  Dragging a window edge
+   puts AppKit into a modal event-tracking run loop that does not return until the mouse is
+   released.  Our loop is blocked inside SDL_PollEvent for that whole time, so no frame is
+   drawn and the window shows stale or blank content until the drag ends — which is the
+   'not live-resizing' this fixes, and is expected behaviour for any SDL program on macOS
+   that only pumps the queue.  It is not a glass bug and it is not a bug in SDL.
 
-      ((= type +window-event+)
-       (let ((what (ev-u8 sap 12)))
-         (when (= what +windowevent-size-changed+)
-           ;; SDL_WindowEvent carries the new size in data1/data2, at 16 and 20.
-           ;;
-           ;; ONLY WHEN IT DIFFERS, and that guard is the whole of what keeps this from
-           ;; oscillating: the desktop resizing makes the loop below call
-           ;; %SET-WINDOW-SIZE, which SDL answers with another SIZE-CHANGED, which would
-           ;; ask for the size we are already at, forever.
-           (let ((w (ev-i32 sap 16)) (h (ev-i32 sap 20)))
-             (when (and (plusp w) (plusp h)
-                        (not (and (eql w (funcall (src-width r)))
-                                  (eql h (funcall (src-height r))))))
-               (funcall (src-want-size r) w h))))
-         (not (= what +windowevent-close+))))
+   An event WATCH is called where the event is GENERATED rather than where it is polled,
+   so it runs inside that modal loop.  Redrawing from here is the documented way out, and
+   is why this is a C callback and not another branch in HANDLE-EVENT.
 
-      ((or (= type +key-down+) (= type +key-up+))
-       ;; keysym.sym is an Sint32 at offset 20 of SDL_KeyboardEvent.
-       (let ((keysym (sdl->keysym (ev-i32 sap 20))))
-         (when keysym
-           (funcall (src-key r) (= type +key-down+) keysym)))
-       t)
+   Float traps are masked because this is entered from C, where SBCL's usual masking is not
+   in force, and the compositor underneath does float arithmetic.  Errors are swallowed:
+   this runs inside somebody else's run loop, and a condition unwinding through Cocoa is a
+   crash rather than a backtrace."
+  (declare (ignore userdata))
+  (sb-int:with-float-traps-masked (:invalid :inexact :overflow :underflow :divide-by-zero)
+    (let ((v *live-viewer*))
+      (when (and v (not *in-live-draw*) (v-texture v))
+        (let* ((sap (sb-alien:alien-sap event)))
+          (when (= (ev-u32 sap 0) +window-event+)
+            (let ((what (ev-u8 sap 12)))
+              ;; RESIZED is the one that arrives during a drag; SIZE_CHANGED covers the
+              ;; programmatic case, and taking both costs a redraw that was due anyway.
+              (when (or (= what +windowevent-resized+)
+                        (= what +windowevent-size-changed+))
+                (let ((*in-live-draw* t))
+                  (ignore-errors (push-frame v))))))))))
+  1)                                    ; keep the event; a watch must not consume it
 
-      ((= type +mouse-motion+)
-       (multiple-value-bind (fx fy) (to-fb v (ev-i32 sap 20) (ev-i32 sap 24))
-         (setf (v-last-x v) fx (v-last-y v) fy))
-       (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v))
-       t)
+  (defun push-frame (v)
+    "Upload the remote's framebuffer and present it.
 
-      ((or (= type +mouse-button-down+) (= type +mouse-button-up+))
-       (let ((bit (button-bit (ev-u8 sap 16))))
+     The whole screen, not the damaged part: glass/client reports dirtiness as a
+     flag rather than a rectangle list, so there is nothing finer to act on, and a
+     1280x800 upload is four megabytes of memcpy that a GPU eats without noticing.
+     Idle costs nothing because we only get here when the flag was set."
+    ;; Before the fb is read, so a size settled here is reflected by this very frame rather
+    ;; than by the next one.
+    (settle-size v)
+    (let* ((fb (funcall (src-fb (v-source v))))
+           (px (glass:fb-pixels fb)))
+      (sb-sys:with-pinned-objects (px)
+        (sdl (%update-texture (v-texture v) (null-ptr)
+                              (sb-alien:sap-alien (sb-sys:vector-sap px) (* t))
+                              (* 4 (v-width v)))))
+      (sdl (%render-clear (v-renderer v)))
+      (sdl (%render-copy (v-renderer v) (v-texture v) (null-ptr) (null-ptr)))
+      (sdl (%render-present (v-renderer v)))))
+
+  ;;; ---- input -------------------------------------------------------------------
+
+  (defun button-bit (sdl-button)
+    "SDL numbers buttons 1/2/3; RFB carries them as a bitmask."
+    (case sdl-button (1 1) (2 2) (3 4) (t 0)))
+
+  (defun handle-event (v sap)
+    "Translate one SDL event and forward it.  Returns NIL to stop the viewer."
+    (let ((type (ev-u32 sap 0))
+          (r (v-source v)))
+      (cond
+        ((= type +quit+) nil)
+
+        ((= type +window-event+)
+         (let ((what (ev-u8 sap 12)))
+           (when (= what +windowevent-size-changed+)
+             ;; SDL_WindowEvent carries the new size in data1/data2, at 16 and 20.
+             ;;
+             ;; ONLY WHEN IT DIFFERS, and that guard is the whole of what keeps this from
+             ;; oscillating: the desktop resizing makes the loop below call
+             ;; %SET-WINDOW-SIZE, which SDL answers with another SIZE-CHANGED, which would
+             ;; ask for the size we are already at, forever.
+             (let ((w (ev-i32 sap 16)) (h (ev-i32 sap 20)))
+               (when (and (plusp w) (plusp h)
+                          (not (and (eql w (funcall (src-width r)))
+                                    (eql h (funcall (src-height r))))))
+                 (funcall (src-want-size r) w h))))
+           (not (= what +windowevent-close+))))
+
+        ((or (= type +key-down+) (= type +key-up+))
+         ;; keysym.sym is an Sint32 at offset 20 of SDL_KeyboardEvent.
+         (let ((keysym (sdl->keysym (ev-i32 sap 20))))
+           (when keysym
+             (funcall (src-key r) (= type +key-down+) keysym)))
+         t)
+
+        ((= type +mouse-motion+)
          (multiple-value-bind (fx fy) (to-fb v (ev-i32 sap 20) (ev-i32 sap 24))
            (setf (v-last-x v) fx (v-last-y v) fy))
-         (setf (v-buttons v) (if (= type +mouse-button-down+)
-                                 (logior (v-buttons v) bit)
-                                 (logandc2 (v-buttons v) bit)))
-           ;; The MAPPED position, not the raw one: storing the mapping and then sending
-           ;; the event's own coordinates is how a click misses what the cursor is over.
-           (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v)))
-       t)
+         (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v))
+         t)
 
-      ((= type +mouse-wheel+)
-       ;; RFB has no wheel: it is buttons 4 and 5, pressed and released. The
-       ;; position is not carried in a wheel event, so the last one stands.
-       (let* ((dy (ev-i32 sap 20))
-              (bit (cond ((plusp dy) 8) ((minusp dy) 16) (t 0))))
-         (unless (zerop bit)
-           (let ((x (v-last-x v)) (y (v-last-y v)))
-             (funcall (src-pointer r) (logior (v-buttons v) bit) x y)
-             (funcall (src-pointer r) (v-buttons v) x y))))
-       t)
+        ((or (= type +mouse-button-down+) (= type +mouse-button-up+))
+         (let ((bit (button-bit (ev-u8 sap 16))))
+           (multiple-value-bind (fx fy) (to-fb v (ev-i32 sap 20) (ev-i32 sap 24))
+             (setf (v-last-x v) fx (v-last-y v) fy))
+           (setf (v-buttons v) (if (= type +mouse-button-down+)
+                                   (logior (v-buttons v) bit)
+                                   (logandc2 (v-buttons v) bit)))
+             ;; The MAPPED position, not the raw one: storing the mapping and then sending
+             ;; the event's own coordinates is how a click misses what the cursor is over.
+             (funcall (src-pointer r) (v-buttons v) (v-last-x v) (v-last-y v)))
+         t)
 
-      (t t))))
+        ((= type +mouse-wheel+)
+         ;; RFB has no wheel: it is buttons 4 and 5, pressed and released. The
+         ;; position is not carried in a wheel event, so the last one stands.
+         (let* ((dy (ev-i32 sap 20))
+                (bit (cond ((plusp dy) 8) ((minusp dy) 16) (t 0))))
+           (unless (zerop bit)
+             (let ((x (v-last-x v)) (y (v-last-y v)))
+               (funcall (src-pointer r) (logior (v-buttons v) bit) x y)
+               (funcall (src-pointer r) (v-buttons v) x y))))
+         t)
 
-;;; ---- the loop ----------------------------------------------------------------
+        (t t))))
 
-(defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60))
-  "Open a window onto a glass desktop and pump it until closed.
+  ;;; ---- the loop ----------------------------------------------------------------
 
-   Runs on the calling thread and does not return until the window closes, which
-   on macOS is not a preference: Cocoa insists the event loop is the main thread,
-   so this is a function you CALL from your main thread rather than a server you
-   start.
+  (defun view (&key (host "127.0.0.1") (port 5901) seat (title nil) (fps 60))
+    "Open a window onto a glass desktop and pump it until closed.
 
-   SEAT is a desktop in THIS image (CLIM-GLASS:ADD-WM-SEAT, typically made with
-   :SERVE NIL) and there is no transport at all: the framebuffer is read where it
-   already is and keys go straight to the seat's injector.  Otherwise HOST:PORT is
-   an RFB desktop somewhere -- a hostname beside a port, or `unix:/path/seat-1.rfb'
-   for a socket file, which is the same thing with the kernel checking who may
-   connect.
+     Runs on the calling thread and does not return until the window closes, which
+     on macOS is not a preference: Cocoa insists the event loop is the main thread,
+     so this is a function you CALL from your main thread rather than a server you
+     start.
 
-   The one-image case is the point rather than an optimisation.  On the hardware
-   this is aimed at there is no socket to have and no second process to be: the
-   desktop composites into a framebuffer and something puts that on a screen.  Here
-   that something is SDL; there it is glass/fb itself."
-  (load-sdl)
-  (unless (zerop (sdl (%init +init-video+)))
-    (error "glass-sdl: SDL_Init failed: ~a" (sdl (%get-error))))
-  (let ((v (setf *probe-viewer*
-                 (make-viewer :source (if seat
-                                          (make-seat-source seat)
-                                          (make-remote-source host port)))))
-        (ev (sb-alien:make-alien (sb-alien:unsigned 8) 64)))
-    (unwind-protect
-         (let ((r (v-source v)))
-           ;; Wait for the handshake so the window opens at the desktop's size
-           ;; rather than opening small and jumping.  A local seat is up already.
-           (loop repeat 200 until (funcall (src-live-p r)) do (sleep 0.05))
-           (unless (funcall (src-live-p r))
-             (error "glass-sdl: no answer from ~a:~d" host port))
-           (setf (v-width v) (funcall (src-width r))
-                 (v-height v) (funcall (src-height r)))
-           ;; SMOOTH RATHER THAN BLOCKY when the window and the framebuffer are not the same
-           ;; size — mid-drag, or a desktop that is a fixed size on purpose.  SDL's default is
-           ;; "0", nearest neighbour, which is the hard staircase on every glyph of a scaled
-           ;; desktop.  Set BEFORE the texture exists: SDL reads this when a texture is made,
-           ;; not when one is drawn, so setting it afterwards is a setting that does nothing.
-           (%set-hint "SDL_RENDER_SCALE_QUALITY" "linear")
-           (funcall (src-on-resize r)
-                    (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
-           (setf (v-window v)
-                 (sdl (%create-window (or title
-                                          ;; THE SESSION's name, which is what an RFB
-                                          ;; client puts in its title bar and what the
-                                          ;; desktop writes in its own corner — the same
-                                          ;; name in all three places.  The seat is a
-                                          ;; place at the session, not the thing being
-                                          ;; looked at, so it is the fallback and not the
-                                          ;; answer.
-                                          (if seat
-                                              (let ((n (find-symbol "SEAT-NAME" "CLIM-GLASS")))
-                                                (format nil "glass — ~a"
-                                                        (if (and (stringp glass:*desktop-name*)
-                                                                 (plusp (length glass:*desktop-name*))
-                                                                 (not (string= glass:*desktop-name* "glass")))
-                                                            glass:*desktop-name*
-                                                            (or (and n (fboundp n)
-                                                                     (ignore-errors (funcall n seat)))
-                                                                "desktop"))))
-                                              (format nil "glass — ~a:~d" host port)))
-                                      #x1FFF0000 #x1FFF0000
-                                      (v-width v) (v-height v)
-                                      (logior +window-shown+ +window-resizable+))))
-           (when (sb-alien:null-alien (v-window v))
-             (error "glass-sdl: could not open a window: ~a" (sdl (%get-error))))
-           ;; Before anything asks the window its size, which the very next form does.
-           (multiple-value-bind (probe free) (make-size-probe (v-window v))
-             (setf (v-size-probe v) probe (v-free-size-probe v) free))
-           ;; The same settling SETTLE-SIZE does every frame, done once here because the
-           ;; texture below should be created at the right size rather than made, replaced
-           ;; and thrown away on the first frame.  See SETTLE-SIZE for why a window's
-           ;; granted size has to be asked for rather than waited for.
-           (multiple-value-bind (gw gh) (window-points v)
-             (when (and (plusp gw) (plusp gh)
-                        (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
-               (funcall (src-want-size r) gw gh)
-               (setf (v-width v) (funcall (src-width r))
-                     (v-height v) (funcall (src-height r)))))
-           (setf (v-renderer v)
-                 (sdl (%create-renderer (v-window v) -1
-                                        (logior +renderer-accelerated+ +renderer-presentvsync+))))
-           (when (sb-alien:null-alien (v-renderer v))
-             ;; No GPU path (a bare VM, a stubborn driver): software still draws.
-             (setf (v-renderer v) (sdl (%create-renderer (v-window v) -1 0))))
-           (make-texture v)
-           (sdl (%start-text-input))
-           (let ((sap (sb-alien:alien-sap ev))
-                 (frame-ms (max 1 (floor 1000 fps))))
-             (loop
-               (loop while (plusp (sdl (%poll-event (sb-alien:sap-alien sap (* t)))))
-                     do (unless (handle-event v sap) (return-from view t)))
-               (when (v-resized v)
-                 (setf (v-resized v) nil
-                       (v-width v) (funcall (src-width r))
-                       (v-height v) (funcall (src-height r)))
-                 ;; Asked for, not yet granted — see the PENDING slots.  Half a second of
-                 ;; grace at 60 Hz, after which whatever the window actually is wins.
-                 (setf (v-pending-w v) (v-width v) (v-pending-h v) (v-height v)
-                       (v-pending-frames v) 30)
-                 (sdl (%set-window-size (v-window v) (v-width v) (v-height v)))
-                 (make-texture v)
+     SEAT is a desktop in THIS image (CLIM-GLASS:ADD-WM-SEAT, typically made with
+     :SERVE NIL) and there is no transport at all: the framebuffer is read where it
+     already is and keys go straight to the seat's injector.  Otherwise HOST:PORT is
+     an RFB desktop somewhere -- a hostname beside a port, or `unix:/path/seat-1.rfb'
+     for a socket file, which is the same thing with the kernel checking who may
+     connect.
+
+     The one-image case is the point rather than an optimisation.  On the hardware
+     this is aimed at there is no socket to have and no second process to be: the
+     desktop composites into a framebuffer and something puts that on a screen.  Here
+     that something is SDL; there it is glass/fb itself."
+    (load-sdl)
+    (unless (zerop (sdl (%init +init-video+)))
+      (error "glass-sdl: SDL_Init failed: ~a" (sdl (%get-error))))
+    (let ((v (setf *probe-viewer*
+                   (make-viewer :source (if seat
+                                            (make-seat-source seat)
+                                            (make-remote-source host port)))))
+          (ev (sb-alien:make-alien (sb-alien:unsigned 8) 64)))
+      (unwind-protect
+           (let ((r (v-source v)))
+             ;; Wait for the handshake so the window opens at the desktop's size
+             ;; rather than opening small and jumping.  A local seat is up already.
+             (loop repeat 200 until (funcall (src-live-p r)) do (sleep 0.05))
+             (unless (funcall (src-live-p r))
+               (error "glass-sdl: no answer from ~a:~d" host port))
+             (setf (v-width v) (funcall (src-width r))
+                   (v-height v) (funcall (src-height r)))
+             ;; SMOOTH RATHER THAN BLOCKY when the window and the framebuffer are not the same
+             ;; size — mid-drag, or a desktop that is a fixed size on purpose.  SDL's default is
+             ;; "0", nearest neighbour, which is the hard staircase on every glyph of a scaled
+             ;; desktop.  Set BEFORE the texture exists: SDL reads this when a texture is made,
+             ;; not when one is drawn, so setting it afterwards is a setting that does nothing.
+             (%set-hint "SDL_RENDER_SCALE_QUALITY" "linear")
+             (funcall (src-on-resize r)
+                      (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
+             (setf (v-window v)
+                   (sdl (%create-window (or title
+                                            ;; THE SESSION's name, which is what an RFB
+                                            ;; client puts in its title bar and what the
+                                            ;; desktop writes in its own corner — the same
+                                            ;; name in all three places.  The seat is a
+                                            ;; place at the session, not the thing being
+                                            ;; looked at, so it is the fallback and not the
+                                            ;; answer.
+                                            (if seat
+                                                (let ((n (find-symbol "SEAT-NAME" "CLIM-GLASS")))
+                                                  (format nil "glass — ~a"
+                                                          (if (and (stringp glass:*desktop-name*)
+                                                                   (plusp (length glass:*desktop-name*))
+                                                                   (not (string= glass:*desktop-name* "glass")))
+                                                              glass:*desktop-name*
+                                                              (or (and n (fboundp n)
+                                                                       (ignore-errors (funcall n seat)))
+                                                                  "desktop"))))
+                                                (format nil "glass — ~a:~d" host port)))
+                                        #x1FFF0000 #x1FFF0000
+                                        (v-width v) (v-height v)
+                                        (logior +window-shown+ +window-resizable+))))
+             (when (sb-alien:null-alien (v-window v))
+               (error "glass-sdl: could not open a window: ~a" (sdl (%get-error))))
+             ;; Before anything asks the window its size, which the very next form does.
+             (multiple-value-bind (probe free) (make-size-probe (v-window v))
+               (setf (v-size-probe v) probe (v-free-size-probe v) free))
+             ;; The same settling SETTLE-SIZE does every frame, done once here because the
+             ;; texture below should be created at the right size rather than made, replaced
+             ;; and thrown away on the first frame.  See SETTLE-SIZE for why a window's
+             ;; granted size has to be asked for rather than waited for.
+             (multiple-value-bind (gw gh) (window-points v)
+               (when (and (plusp gw) (plusp gh)
+                          (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
+                 (funcall (src-want-size r) gw gh)
+                 (setf (v-width v) (funcall (src-width r))
+                       (v-height v) (funcall (src-height r)))))
+             (setf (v-renderer v)
+                   (sdl (%create-renderer (v-window v) -1
+                                          (logior +renderer-accelerated+ +renderer-presentvsync+))))
+             (when (sb-alien:null-alien (v-renderer v))
+               ;; No GPU path (a bare VM, a stubborn driver): software still draws.
+               (setf (v-renderer v) (sdl (%create-renderer (v-window v) -1 0))))
+             (make-texture v)
+             ;; Only now: the watch can fire the moment it is registered, and it draws.
+             (setf *live-viewer* v)
+             (%add-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
+                                              (* t))
+                               (null-ptr))
+             (sdl (%start-text-input))
+             (let ((sap (sb-alien:alien-sap ev))
+                   (frame-ms (max 1 (floor 1000 fps))))
+               (loop
+                 (loop while (plusp (sdl (%poll-event (sb-alien:sap-alien sap (* t)))))
+                       do (unless (handle-event v sap) (return-from view t)))
+                 (when (v-resized v)
+                   ;; THE WATCH MUST NOT RUN INSIDE THIS.  %SET-WINDOW-SIZE delivers its
+                   ;; SIZE_CHANGED synchronously, so the watch fires from within the call
+                   ;; below — after the width has been updated but before MAKE-TEXTURE has
+                   ;; rebuilt to match, which is a frame uploaded at the wrong stride, and
+                   ;; with SETTLE-SIZE running against a half-applied state.  It ratcheted a
+                   ;; 1456-wide window down to 1029.  *IN-LIVE-DRAW* already means "a draw is
+                   ;; in progress, do not start another", which is exactly the claim here.
+                   (let ((*in-live-draw* t))
+                     (setf (v-resized v) nil
+                           (v-width v) (funcall (src-width r))
+                           (v-height v) (funcall (src-height r)))
+                     ;; Asked for, not yet granted — see the PENDING slots.  Half a second of
+                     ;; grace at 60 Hz, after which whatever the window actually is wins.
+                     (setf (v-pending-w v) (v-width v) (v-pending-h v) (v-height v)
+                           (v-pending-frames v) 30)
+                     (sdl (%set-window-size (v-window v) (v-width v) (v-height v)))
+                     (make-texture v))
                  (push-frame v))
                (if (funcall (src-dirty-p r))
                    (push-frame v)
@@ -423,6 +481,12 @@
                  (sdl (%set-window-title (v-window v) "glass — reconnecting…"))
                  (sdl (%delay 200))))))
       (ignore-errors (funcall (src-stop (v-source v))))
+      ;; Off FIRST, before anything it touches is destroyed — a watch firing against a
+      ;; freed texture is a crash inside Cocoa, the worst place to have one.
+      (%del-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
+                                       (* t))
+                        (null-ptr))
+      (setf *live-viewer* nil)
       (when (v-free-size-probe v)
         (ignore-errors (funcall (v-free-size-probe v)))
         (setf (v-free-size-probe v) nil (v-size-probe v) nil))

@@ -82,7 +82,15 @@
 (sb-alien:define-alien-routine ("SDL_RenderCopy" %render-copy) sb-alien:int
   (renderer (* t)) (texture (* t)) (src (* t)) (dst (* t)))
 (sb-alien:define-alien-routine ("SDL_RenderPresent" %render-present) sb-alien:void (r (* t)))
+(sb-alien:define-alien-routine ("SDL_PumpEvents" %pump-events) sb-alien:void)
 (sb-alien:define-alien-routine ("SDL_PollEvent" %poll-event) sb-alien:int (event (* t)))
+;; An event WATCH, which is not the same thing as the queue.  A watch is called wherever the
+;; event is generated — including from inside the modal run loop AppKit enters while a window
+;; edge is being dragged, which is exactly when SDL_PollEvent is not being reached.
+(sb-alien:define-alien-routine ("SDL_AddEventWatch" %add-event-watch) sb-alien:void
+  (filter (* t)) (userdata (* t)))
+(sb-alien:define-alien-routine ("SDL_DelEventWatch" %del-event-watch) sb-alien:void
+  (filter (* t)) (userdata (* t)))
 (sb-alien:define-alien-routine ("SDL_StartTextInput" %start-text-input) sb-alien:void)
 (sb-alien:define-alien-routine ("SDL_Delay" %delay) sb-alien:void (ms sb-alien:unsigned-int))
 
@@ -112,6 +120,7 @@
 (defconstant +mouse-button-up+ #x402)
 (defconstant +mouse-wheel+ #x403)
 (defconstant +windowevent-close+ 14)
+(defconstant +windowevent-resized+ 5)
 (defconstant +windowevent-size-changed+ 6)
 
 (defun ev-u32 (sap off) (sb-sys:sap-ref-32 sap off))
