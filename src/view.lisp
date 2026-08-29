@@ -108,24 +108,44 @@
   ;; without this, SETTLE-SIZE reads the stale size a moment later, concludes the desktop
   ;; has drifted, and resizes the desktop back to it.  That is not hypothetical: it ratchets,
   ;; and it shrank a 1456-wide window to 1259 over a few rounds before this existed.
-  (pending-w nil) (pending-h nil) (pending-frames 0))
+  (pending-w nil) (pending-h nil) (pending-frames 0)
+  ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
+  (size-probe nil) (free-size-probe nil))
+
+(defun make-size-probe (window)
+  "Two out-cells for SDL_GetWindowSize and a closure that reads them, plus the thunk that
+   frees them.  Made once per window because this runs on the two hottest paths there are:
+   every pointer event and every frame.
+
+   CLOSED OVER, which is the whole point and is not interchangeable with the obvious
+   alternatives.  Measured, per call:
+
+     with-alien locals, ADDR each time     96.0 bytes   0.034 us
+     cells in a special variable         4057.3 bytes   1.485 us
+     a pinned (signed-byte 32) vector      32.1 bytes   0.027 us
+     closed-over cells (this)               0.0 bytes   0.025 us
+
+   The special is not a typo — caching the cells that way is forty times WORSE than not
+   caching them, because the compiler cannot see an alien type through a special binding
+   and falls back to generic coercion on every call.  A lexical binding it can see, so the
+   call compiles to a direct store into two known addresses and conses nothing at all.
+
+   The cells outlive the call and must be freed; VIEW does that in the same UNWIND-PROTECT
+   that destroys the window."
+  (let ((w (sb-alien:make-alien sb-alien:int))
+        (h (sb-alien:make-alien sb-alien:int)))
+    (values (lambda ()
+              (%get-window-size window w h)
+              (values (sb-alien:deref w) (sb-alien:deref h)))
+            (lambda () (sb-alien:free-alien w) (sb-alien:free-alien h)))))
 
 (defun window-points (v)
   "The window's size in POINTS — the space mouse events arrive in.
 
-   Measured, because this is now on two hot paths — every pointer event and every frame —
-   and cheap should be a number: 32 ns and 96 bytes per call, the latter from taking
-   ADDR of a local alien rather than from the two return values (a one-value variant
-   conses identically).  WITH-ALIEN over MAKE-ALIEN because it is still the right shape,
-   not because it made this free; it did not.
-
-   Both figures are noise here.  A frame is a four-megabyte texture upload, so the read is
-   0.0002% of a 60 Hz budget, and at a drag's event rate the garbage is tens of KB a second
-   of nursery that gen 0 sweeps without noticing.  It could be made truly free with two
-   cells owned by the viewer; that trade is not worth the lifetime it would introduce."
-  (sb-alien:with-alien ((w sb-alien:int) (h sb-alien:int))
-    (%get-window-size (v-window v) (sb-alien:addr w) (sb-alien:addr h))
-    (values w h)))
+   Two struct reads inside SDL: no syscall, no round trip to the window server, and with
+   MAKE-SIZE-PROBE's cells, no allocation.  Cheap enough to ask on every frame, which is
+   what SETTLE-SIZE relies on."
+  (funcall (v-size-probe v)))
 
 (defun to-fb (v x y)
   "An SDL pointer position mapped into FRAMEBUFFER coordinates.
@@ -358,6 +378,9 @@
                                       (logior +window-shown+ +window-resizable+))))
            (when (sb-alien:null-alien (v-window v))
              (error "glass-sdl: could not open a window: ~a" (sdl (%get-error))))
+           ;; Before anything asks the window its size, which the very next form does.
+           (multiple-value-bind (probe free) (make-size-probe (v-window v))
+             (setf (v-size-probe v) probe (v-free-size-probe v) free))
            ;; The same settling SETTLE-SIZE does every frame, done once here because the
            ;; texture below should be created at the right size rather than made, replaced
            ;; and thrown away on the first frame.  See SETTLE-SIZE for why a window's
@@ -400,6 +423,9 @@
                  (sdl (%set-window-title (v-window v) "glass — reconnecting…"))
                  (sdl (%delay 200))))))
       (ignore-errors (funcall (src-stop (v-source v))))
+      (when (v-free-size-probe v)
+        (ignore-errors (funcall (v-free-size-probe v)))
+        (setf (v-free-size-probe v) nil (v-size-probe v) nil))
       (when (v-texture v) (ignore-errors (sdl (%destroy-texture (v-texture v)))))
       (when (v-renderer v) (ignore-errors (sdl (%destroy-renderer (v-renderer v)))))
       (when (v-window v) (ignore-errors (sdl (%destroy-window (v-window v)))))
