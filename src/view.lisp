@@ -110,7 +110,10 @@
   ;; and it shrank a 1456-wide window to 1259 over a few rounds before this existed.
   (pending-w nil) (pending-h nil) (pending-frames 0)
   ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
-  (size-probe nil) (free-size-probe nil))
+  (size-probe nil) (free-size-probe nil)
+  ;; What the last live-resize draw cost, and when it finished — the two numbers the watch
+  ;; needs to decide whether it can afford another.  See the watch for the policy.
+  (last-draw-ms 0.0) (last-draw-at 0))
 
 (defun make-size-probe (window)
   "Two out-cells for SDL_GetWindowSize and a closure that reads them, plus the thunk that
@@ -252,20 +255,46 @@
    crash rather than a backtrace."
   (declare (ignore userdata))
   (sb-int:with-float-traps-masked (:invalid :inexact :overflow :underflow :divide-by-zero)
-    (let ((v *live-viewer*))
-      (when (and v (not *in-live-draw*) (v-texture v))
-        (let* ((sap (sb-alien:alien-sap event)))
-          (when (= (ev-u32 sap 0) +window-event+)
-            (let ((what (ev-u8 sap 12)))
-              ;; RESIZED is the one that arrives during a drag; SIZE_CHANGED covers the
-              ;; programmatic case, and taking both costs a redraw that was due anyway.
-              (when (or (= what +windowevent-resized+)
-                        (= what +windowevent-size-changed+))
-                (let ((*in-live-draw* t))
-                  (ignore-errors (push-frame v))))))))))
+    (let ((v *live-viewer*)
+          (sap (sb-alien:alien-sap event)))
+      (when (and v (not *in-live-draw*) (v-texture v)
+                 (= (ev-u32 sap 0) +window-event+)
+                 ;; RESIZED is the one that arrives during a drag; SIZE_CHANGED covers the
+                 ;; programmatic case, and taking both costs a redraw that was due anyway.
+                 (let ((what (ev-u8 sap 12)))
+                   (or (= what +windowevent-resized+)
+                       (= what +windowevent-size-changed+))))
+        (let ((*in-live-draw* t))
+          (ignore-errors
+            ;; THE SIZE IS STATE; THE PICTURE IS ONLY A PICTURE.  Different obligations and
+            ;; very different costs, which is what makes eliding possible at all.  Measured
+            ;; here: adopting a new size is 0.81 ms, a draw is 8.33 ms — and nearly all of
+            ;; the draw is the wait for vblank, so the resize is free in the noise beside it.
+            ;;
+            ;; The size is therefore taken on EVERY event.  Skipping it would leave the
+            ;; window and the desktop disagreeing, and until something corrected that every
+            ;; frame would be scaled and every click misplaced.
+            (settle-size v)
+            ;; The draw is skippable, and skipping one costs an intermediate frame nobody
+            ;; will miss mid-drag.  Self-pacing rather than a tuned constant: draw again
+            ;; once as much time has passed as the last draw took.  At the normal 8 ms that
+            ;; is every event and the drag is smooth; if a draw ever cost 100 ms — a much
+            ;; bigger desktop, a slower machine, a compositor doing more — it spaces itself
+            ;; out and the drag stays responsive with fewer frames in it.  Nothing to detect
+            ;; separately and no threshold to pick: the measurement IS the policy, and one
+            ;; slow frame buys one skip window rather than a standing penalty.
+            (let ((since (/ (* 1000.0 (- (get-internal-real-time) (v-last-draw-at v)))
+                            internal-time-units-per-second)))
+              (when (>= since (v-last-draw-ms v))
+                (let ((start (get-internal-real-time)))
+                  (push-frame v)
+                  (setf (v-last-draw-at v) (get-internal-real-time)
+                        (v-last-draw-ms v)
+                        (/ (* 1000.0 (- (v-last-draw-at v) start))
+                           internal-time-units-per-second))))))))))
   1)                                    ; keep the event; a watch must not consume it
 
-  (defun push-frame (v)
+(defun push-frame (v)
     "Upload the remote's framebuffer and present it.
 
      The whole screen, not the damaged part: glass/client reports dirtiness as a
