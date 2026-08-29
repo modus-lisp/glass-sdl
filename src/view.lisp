@@ -104,31 +104,6 @@
   (last-x 0) (last-y 0)            ; a wheel event carries no position
   (resized nil))
 
-(defun usable-size (want-w want-h)
-  "WANT-W x WANT-H clamped to the part of the display a window can actually occupy.
-
-   macOS does not refuse an oversized window, it SILENTLY CAPS it between the menu bar and
-   the Dock — so asking for 1600x1000 on a screen with 1600x1000 of glass gets a window
-   some tens of pixels shorter, and every symptom after that is a consequence of the
-   framebuffer and the window no longer being the same size: SDL stretches the texture, and
-   the pointer arithmetic below has a scale to undo.  Asking for a size that fits means the
-   common case is 1:1 and no scaling happens at all.
-
-   A margin comes off as well.  Usable bounds are exact, and a window at exactly that size
-   has its title bar flush against the menu bar with nowhere to grab it."
-  (let ((rect (sb-alien:make-alien sb-alien:int 4)))
-    (unwind-protect
-         (if (zerop (%get-display-usable-bounds 0 (sb-alien:cast rect (* t))))
-             (let ((max-w (- (sb-alien:deref rect 2) 40))
-                   (max-h (- (sb-alien:deref rect 3) 60)))
-               (values (max 320 (min want-w max-w))
-                       (max 240 (min want-h max-h))))
-             ;; No answer (a headless display index, an SDL that does not implement it):
-             ;; ask for what was wanted.  Being capped is the thing this avoids, not a
-             ;; thing it must prevent.
-             (values want-w want-h))
-      (sb-alien:free-alien rect))))
-
 (defun window-points (v)
   "The window's size in POINTS — the space mouse events arrive in."
   (let ((w (sb-alien:make-alien sb-alien:int))
@@ -292,19 +267,6 @@
            ;; desktop.  Set BEFORE the texture exists: SDL reads this when a texture is made,
            ;; not when one is drawn, so setting it afterwards is a setting that does nothing.
            (%set-hint "SDL_RENDER_SCALE_QUALITY" "linear")
-           ;; ...AND MAKE 1:1 THE NORMAL CASE, which beats scaling well.  macOS does not refuse
-           ;; an oversized window, it silently caps it between the menu bar and the Dock — so a
-           ;; desktop asked to be taller than the screen becomes a permanently scaled one, with
-           ;; no event to say so.  Ask the DESKTOP for a size that fits before opening a window
-           ;; onto it.  For a local seat WANT-SIZE is the seat's own resize and has already
-           ;; happened by the time it returns, so the window is created at the settled size; for
-           ;; a remote one the request is in flight and the existing SIZE-CHANGED path converges,
-           ;; exactly as it does for a drag.
-           (multiple-value-bind (uw uh) (usable-size (v-width v) (v-height v))
-             (unless (and (eql uw (v-width v)) (eql uh (v-height v)))
-               (funcall (src-want-size r) uw uh)
-               (setf (v-width v) (funcall (src-width r))
-                     (v-height v) (funcall (src-height r)))))
            (funcall (src-on-resize r)
                     (lambda (w h) (declare (ignore w h)) (setf (v-resized v) t)))
            (setf (v-window v)
@@ -332,6 +294,25 @@
                                       (logior +window-shown+ +window-resizable+))))
            (when (sb-alien:null-alien (v-window v))
              (error "glass-sdl: could not open a window: ~a" (sdl (%get-error))))
+           ;; WHAT WE WERE ACTUALLY GIVEN, which is not always what we asked for and is not
+           ;; announced.  macOS caps a window between the menu bar and the Dock; an X11 window
+           ;; manager applies its own constraints; a tiling one ignores the request outright.
+           ;; In every case the window is CREATED at the constrained size, so there is no change
+           ;; to report and no SIZE-CHANGED arrives — measured: asking for 1600x1000 here yields
+           ;; 1456x921 and exactly zero window events.  That silence is why the resize handler
+           ;; below, which has always been correct for a later change, never saw this one.
+           ;;
+           ;; Measured rather than predicted.  SDL_GetDisplayUsableBounds can only answer for
+           ;; platforms that expose a work area — X11 reads _NET_WORKAREA, Wayland has no such
+           ;; concept and returns the whole display — so a prediction is right on one platform
+           ;; and quietly wrong elsewhere.  Asking the window is right on all of them, and more
+           ;; accurate even here: the guess gave up 40x32 pixels the window server never took.
+           (multiple-value-bind (gw gh) (window-points v)
+             (when (and (plusp gw) (plusp gh)
+                        (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
+               (funcall (src-want-size r) gw gh)
+               (setf (v-width v) (funcall (src-width r))
+                     (v-height v) (funcall (src-height r)))))
            (setf (v-renderer v)
                  (sdl (%create-renderer (v-window v) -1
                                         (logior +renderer-accelerated+ +renderer-presentvsync+))))

@@ -57,11 +57,6 @@
 ;; RENDER_SCALE_QUALITY when the texture is made, not when it is drawn.
 (sb-alien:define-alien-routine ("SDL_SetHint" %set-hint) sb-alien:int
   (name sb-alien:c-string) (value sb-alien:c-string))
-;; The desktop MINUS the menu bar and the Dock, which is the part a window can
-;; actually occupy.  SDL_Rect is four Sint32: x, y, w, h.
-(sb-alien:define-alien-routine ("SDL_GetDisplayUsableBounds" %get-display-usable-bounds)
-    sb-alien:int
-  (display sb-alien:int) (rect (* t)))
 ;; In POINTS, which is the same space mouse events arrive in — deliberately not the
 ;; drawable size, which on a Retina panel is twice this.
 (sb-alien:define-alien-routine ("SDL_GetWindowSize" %get-window-size) sb-alien:void
