@@ -22,11 +22,12 @@ boundary."
   ;; (one process, its own window, no wire) there is no socket for sound to arrive on, so it
   ;; is pulled from the mixer directly.  Same capability as the WebRTC gateway's, without any
   ;; of its connectivity: there is nothing to connect to when the mixer is in this image.
-  :depends-on ("glass/client" "glass/audio")
+  :depends-on ("glass/client" "glass/audio" "glass/mic")
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")
                              (:file "sdl")
                              (:file "keys")
-                             (:file "audio")
+                             (:file "audio-out")
+                               (:file "audio-in")
                              (:file "view")))))

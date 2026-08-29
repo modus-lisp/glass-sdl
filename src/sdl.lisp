@@ -122,6 +122,11 @@
   (dev sb-alien:unsigned-int))
 (sb-alien:define-alien-routine ("SDL_ClearQueuedAudio" %clear-queued-audio) sb-alien:void
   (dev sb-alien:unsigned-int))
+;; The capture side of the same queue.  SDL fills it on the device's thread; we take whole
+;; frames off it whenever we get round to it, which is the same bargain QUEUE-AUDIO makes in
+;; the other direction and for the same reason: no Lisp on a real-time thread.
+(sb-alien:define-alien-routine ("SDL_DequeueAudio" %dequeue-audio) sb-alien:unsigned-int
+  (dev sb-alien:unsigned-int) (data (* t)) (len sb-alien:unsigned-int))
 
 (defconstant +init-video+ #x20)
 (defconstant +window-shown+ 4)

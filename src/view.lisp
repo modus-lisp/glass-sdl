@@ -111,6 +111,7 @@
   (pending-w nil) (pending-h nil) (pending-frames 0)
   ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
   (audio nil)                      ; the AUDIO-OUT playing this seat, or NIL
+  (mic nil)                        ; the AUDIO-IN feeding the session, or NIL
   (size-probe nil) (free-size-probe nil)
   ;; ...and the same in pixels.  Under ALLOW_HIGHDPI these differ by the display's scale.
   (pixel-probe nil) (free-pixel-probe nil)
@@ -588,7 +589,12 @@
                             (let ((f (and (find-package "GLASS")
                                           (find-symbol "SESSION-MIXER" "GLASS"))))
                               (and f (fboundp f) (ignore-errors (funcall f)))))))
-               (setf (v-audio v) (start-audio mix))))
+               (setf (v-audio v) (start-audio mix)))
+             ;; ...and the other direction.  Attached even when there is no recognizer to read
+             ;; it: what a microphone is for is not this file's business, and the Mixer window
+             ;; showing an attached-but-silent device is how a denied permission prompt becomes
+             ;; visible instead of looking like a quiet room.
+             (setf (v-mic v) (start-mic)))
            (setf *live-viewer* v)
              (%add-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                               (* t))
@@ -639,6 +645,7 @@
       ;; Off FIRST, before anything it touches is destroyed — a watch firing against a
       ;; freed texture is a crash inside Cocoa, the worst place to have one.
       (ignore-errors (stop-audio (v-audio v)))
+      (ignore-errors (stop-mic (v-mic v)))
       (%del-event-watch (sb-alien:cast (sb-alien:alien-callable-function 'live-resize-watch)
                                        (* t))
                         (null-ptr))

@@ -1,4 +1,4 @@
-;;;; audio.lisp — the desktop, out of this machine's speakers.
+;;;; audio-out.lisp — the desktop, out of this machine's speakers.
 ;;;;
 ;;;; A local viewer was silent, and had always been: glass mixes session audio and can serve
 ;;;; it over a socket to a remote listener, but nothing ever played it HERE.  On the welded
@@ -12,6 +12,11 @@
 ;;;; drains them in C on its own thread, where nothing of ours can stall it.  What we take on
 ;;;; in exchange is watching the queue depth, which is a cheap thing to get right and a
 ;;;; visible thing to get wrong.
+;;;;
+;;;; The SINK half of the pair.  audio-in.lisp is the mic, and the two files are named
+;;;; apart because glass names the directions apart: a sink is a read cursor on the
+;;;; session's mix, a mic is a thing that produces into the session, and conflating them
+;;;; is what kept the microphone inside a socket for as long as it was.
 
 (in-package #:glass-sdl)
 
