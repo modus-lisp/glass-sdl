@@ -447,18 +447,23 @@
 
         ((= type +window-event+)
          (let ((what (ev-u8 sap 12)))
-           (when (= what +windowevent-size-changed+)
-             ;; SDL_WindowEvent carries the new size in data1/data2, at 16 and 20.
-             ;;
-             ;; ONLY WHEN IT DIFFERS, and that guard is the whole of what keeps this from
-             ;; oscillating: the desktop resizing makes the loop below call
-             ;; %SET-WINDOW-SIZE, which SDL answers with another SIZE-CHANGED, which would
-             ;; ask for the size we are already at, forever.
-             (let ((w (ev-i32 sap 16)) (h (ev-i32 sap 20)))
-               (when (and (plusp w) (plusp h)
-                          (not (and (eql w (funcall (src-width r)))
-                                    (eql h (funcall (src-height r))))))
-                 (funcall (src-want-size r) w h))))
+           ;; A SIZE-CHANGED IS NOT ACTED ON HERE.  SETTLE-SIZE runs every frame and measures
+           ;; the window itself, which is the same answer from a better source — and this
+           ;; branch resizing the desktop as well was doing active harm, in two ways.
+           ;;
+           ;; The payload is STALE by the time it is read.  A watch does not consume what it
+           ;; sees, so every event handled during a drag is ALSO still in the queue, and at
+           ;; mouse-up the loop drains the whole backlog at once — each one carrying a size
+           ;; from somewhere in the middle of the drag.  Acting on them replayed the drag in
+           ;; fast-forward while SETTLE-SIZE corrected each one in turn, which is exactly the
+           ;; flicker on release: a burst of resizing that nets to no change, because every
+           ;; one of them was undone.
+           ;;
+           ;; And the units were wrong.  SDL window events carry POINTS; SRC-WIDTH is PIXELS.
+           ;; On a 2x display those can never be equal, so the "only when it differs" guard
+           ;; was ALWAYS true and every event asked the desktop to become half its size.  It
+           ;; survived only because SETTLE-SIZE put it back a frame later, which is the shape
+           ;; of a bug that hides behind its own correction.
            (not (= what +windowevent-close+))))
 
         ((or (= type +key-down+) (= type +key-up+))
