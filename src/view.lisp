@@ -112,6 +112,18 @@
   ;; The window-size probe and the thunk that frees its cells — see MAKE-SIZE-PROBE.
   (title "glass")                  ; the window's name WITHOUT the device indicators
   (devices-shown :none)            ; (MIC-LIVE SPEAKERS-LIVE) as last put in the title
+  ;; WHO ASKED.  A seat resize started by SETTLE-SIZE is the window telling the desktop what
+  ;; size it is; a seat resize started by anything else is the desktop asking the window to
+  ;; become a size.  They must not be answered the same way — see the loop.
+  (resize-from-window nil)
+  ;; THE DISPLAY'S pixels-per-point, measured once.  Not WINDOW-SCALE: that is computed live
+  ;; from the window's own points and pixels, and during a resize those two are updated at
+  ;; different moments — so the ratio between them is briefly nonsense, and a conversion that
+  ;; divides by it asks for a window of a nonsense size.  Asked for 1800 pixels wide, it
+  ;; produced a request small enough to hit the floor.  A display's scale does not change
+  ;; while a window is being dragged, so measuring it once is not a cache, it is the right
+  ;; source.
+  (display-scale 1)
   (audio nil)                      ; the AUDIO-OUT playing this seat, or NIL
   (mic nil)                        ; the AUDIO-IN feeding the session, or NIL
   (size-probe nil) (free-size-probe nil)
@@ -152,6 +164,24 @@
                      (if (and (plusp lw) (plusp pw)) (/ pw lw) 1))
                 (sdl (%destroy-window w))))))
     (error () 1)))
+
+(defparameter *min-points* 320
+  "The smallest the window may become, in points, in either direction.
+
+   THE DESKTOP FOLLOWS THE WINDOW, and nothing said where to stop.  Dragged down to about a
+   hundred points it did not settle there — it collapsed, ending at a one-pixel desktop inside
+   a two-pixel window, every number consistent and the whole thing unusable and unrecoverable,
+   because a window two points wide has no edge left to grab.
+
+   The collapse is a ratchet rather than one bad number: the window is asked for PIXELS/SCALE
+   points, the server grants a shade less near its own limits, the next frame measures that and
+   asks for less again.  Every step is correct.  A floor stops it because the server refuses to
+   go under one, so the measurement feeding the next step cannot keep shrinking.
+
+   Enforced by the WINDOW SERVER and not by us, which is what makes it hold during a drag:
+   SDL_SetWindowMinimumSize means the edge stops moving, rather than us fighting the pointer a
+   frame at a time and losing.")
+
 
 (defun make-pixel-probe (window)
   "The window's size in PIXELS, as a closure over its own out-cells — the same shape and
@@ -286,9 +316,19 @@
              (decf (v-pending-frames v))
              (return-from settle-size nil))
             (t (setf (v-pending-w v) nil (v-pending-h v) nil))))
+    ;; A SECOND FLOOR, for a server that reports under its own minimum — a miniaturise, a
+    ;; display change, a platform where the minimum is advisory.  Belt and braces on
+    ;; purpose: what this prevents is not a small window, it is a desktop that cannot be
+    ;; recovered without a control socket.
+    (let ((floor-px (max 1 (round (* *min-points* (v-display-scale v))))))
+      (when (or (< gw floor-px) (< gh floor-px))
+        (return-from settle-size nil)))
     (when (and (plusp gw) (plusp gh)
                (not (and (eql gw (v-width v)) (eql gh (v-height v)))))
       (let ((r (v-source v)))
+        ;; Marked BEFORE the call, because WANT-SIZE resizes the seat synchronously for a
+        ;; local viewer and the resize callback fires inside it.
+        (setf (v-resize-from-window v) t)
         (funcall (src-want-size r) gw gh)
         (let ((nw (funcall (src-width r))) (nh (funcall (src-height r))))
           ;; Only when the source actually took the new size.  A remote desktop answers on
@@ -590,6 +630,25 @@
                (setf (v-size-probe v) probe (v-free-size-probe v) free))
              (multiple-value-bind (probe free) (make-pixel-probe (v-window v))
                (setf (v-pixel-probe v) probe (v-free-pixel-probe v) free))
+             ;; Before anything measures it, so the first measurement is already floored.
+             (sdl (%set-window-minimum-size (v-window v) *min-points* *min-points*))
+             ;; ...and the display's density, ASKED OF THE SEAT, which is the only party that
+             ;; reliably knows it here.  Two closer sources were tried and are both wrong:
+             ;; measuring THIS window now returns 1, because SDL reports the drawable as the
+             ;; window's own size until the backing store exists, which is after it is shown; and
+             ;; DISPLAY-SCALE's probe returns 1 from the other end, because its window is HIDDEN
+             ;; and one that is never mapped never gets a backing store to be twice the size of.
+             ;; Either answer halves every points<->pixels conversion below, which is what drove an
+             ;; 1800-pixel request down into the minimum-size floor.
+             ;;
+             ;; kiln asks DISPLAY-SCALE before any window exists — the one moment the probe is
+             ;; right — and hands it to the session, so the seat is already carrying the number
+             ;; the whole desktop is drawn at.  A second opinion about that would be one too many.
+             (setf (v-display-scale v)
+                   (or (let ((f (and (find-package "CLIM-GLASS")
+                                     (find-symbol "SEAT-SCALE" "CLIM-GLASS"))))
+                         (and seat f (fboundp f) (ignore-errors (funcall f seat))))
+                       1))
              ;; The same settling SETTLE-SIZE does every frame, done once here because the
              ;; texture below should be created at the right size rather than made, replaced
              ;; and thrown away on the first frame.  See SETTLE-SIZE for why a window's
@@ -709,34 +768,41 @@
                  (loop while (plusp (sdl (%poll-event (sb-alien:sap-alien sap (* t)))))
                        do (unless (handle-event v sap) (return-from view t)))
                  (when (v-resized v)
-                   ;; THE WATCH MUST NOT RUN INSIDE THIS.  %SET-WINDOW-SIZE delivers its
-                   ;; SIZE_CHANGED synchronously, so the watch fires from within the call
-                   ;; below — after the width has been updated but before MAKE-TEXTURE has
-                   ;; rebuilt to match, which is a frame uploaded at the wrong stride, and
-                   ;; with SETTLE-SIZE running against a half-applied state.  It ratcheted a
-                   ;; 1456-wide window down to 1029.  *IN-LIVE-DRAW* already means "a draw is
-                   ;; in progress, do not start another", which is exactly the claim here.
-                   (let ((*in-live-draw* t))
-                     (setf (v-resized v) nil
-                           (v-width v) (funcall (src-width r))
-                           (v-height v) (funcall (src-height r)))
-                     ;; Asked for, not yet granted — see the PENDING slots.  Half a second of
-                     ;; grace at 60 Hz, after which whatever the window actually is wins.
-                     ;;
-                     ;; PENDING is in PIXELS because that is what SETTLE-SIZE compares against, but
-                     ;; %SET-WINDOW-SIZE is told POINTS — it sizes the window, not the drawable.
-                     ;; Handing it pixels on a 2x panel asks for a window twice the size of the
-                     ;; desktop, which is then capped, which then reads as a drift.  The scale is
-                     ;; read live rather than cached: dragging a window between a Retina panel and
-                     ;; an external monitor changes it.
-                     (setf (v-pending-w v) (v-width v) (v-pending-h v) (v-height v)
-                           (v-pending-frames v) 30)
-                     (let ((sc (window-scale v)))
-                       (sdl (%set-window-size (v-window v)
-                                              (max 1 (round (v-width v) sc))
-                                              (max 1 (round (v-height v) sc)))))
-                     (make-texture v))
-                 (push-frame v))
+                   ;; WHO ASKED DECIDES WHETHER TO ANSWER.
+                   ;;
+                   ;; A resize that came from the WINDOW is already true of the window; pushing it back
+                   ;; tells the window a size it already has.  Doing that to a window somebody is dragging
+                   ;; is how the desktop vanished on a one-pixel drag: the drag moved the edge, SETTLE-SIZE
+                   ;; matched the desktop to it, and this told the window to become that — mid-drag,
+                   ;; against the pointer — and the server answered a shade smaller each time round.  The
+                   ;; PENDING guard could not help, because every step was a real request being really
+                   ;; granted; the loop was between two correct behaviours, which is the kind that
+                   ;; converges on nothing.
+                   ;;
+                   ;; A resize from the DESKTOP side — an application asking for a size, a script, the
+                   ;; initial adopt — still has to reach the window, because nothing else will tell it.
+                   ;; That is the only case this should act on.
+                   (let ((from-window (v-resize-from-window v)))
+                     (setf (v-resized v) nil (v-resize-from-window v) nil)
+                     ;; THE WATCH MUST NOT RUN INSIDE THIS.  %SET-WINDOW-SIZE delivers its SIZE_CHANGED
+                     ;; synchronously, so the watch fires from within the call below — after the width has
+                     ;; been updated and before MAKE-TEXTURE has rebuilt to match, which is a frame at the
+                     ;; wrong stride and SETTLE-SIZE reading a half-applied state.  It ratcheted a
+                     ;; 1456-wide window down to 1029.
+                     (let ((*in-live-draw* t))
+                       (setf (v-width v) (funcall (src-width r))
+                             (v-height v) (funcall (src-height r)))
+                       (unless from-window
+                         ;; Asked for, not yet granted — see the PENDING slots.  PENDING is in PIXELS
+                         ;; because that is what SETTLE-SIZE compares; %SET-WINDOW-SIZE is told POINTS.
+                         (setf (v-pending-w v) (v-width v) (v-pending-h v) (v-height v)
+                               (v-pending-frames v) 30)
+                         (let ((sc (v-display-scale v)))
+                           (sdl (%set-window-size (v-window v)
+                                                  (max *min-points* (round (v-width v) sc))
+                                                  (max *min-points* (round (v-height v) sc))))))
+                       (make-texture v))
+                     (push-frame v)))
                ;; The title says which devices are live, and the devices can come and go on
                ;; other threads — a microphone opens the first time something listens.  Only
                ;; when it CHANGES: SDL_SetWindowTitle on every frame is a syscall per frame

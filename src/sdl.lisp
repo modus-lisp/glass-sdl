@@ -65,6 +65,11 @@
 ;; without it.  The framebuffer wants this; the mouse wants the one above.
 (sb-alien:define-alien-routine ("SDL_GetWindowSizeInPixels" %get-window-pixels) sb-alien:void
   (window (* t)) (w (* sb-alien:int)) (h (* sb-alien:int)))
+;; A FLOOR THE WINDOW SERVER ENFORCES.  Without one the desktop follows the window all the
+;; way down, and "all the way down" turned out to be literal — see *MIN-POINTS*.
+(sb-alien:define-alien-routine ("SDL_SetWindowMinimumSize" %set-window-minimum-size)
+    sb-alien:void
+  (window (* t)) (w sb-alien:int) (h sb-alien:int))
 (sb-alien:define-alien-routine ("SDL_CreateWindow" %create-window) (* t)
   (title sb-alien:c-string) (x sb-alien:int) (y sb-alien:int)
   (w sb-alien:int) (h sb-alien:int) (flags sb-alien:unsigned-int))
