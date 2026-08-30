@@ -30,11 +30,13 @@ jobs:
         with: { path: glass-sdl }
 
       # glass-sdl is one repo in a workspace of them; the probe finds siblings
-      # relative to itself, so they have to sit beside it.
+      # relative to itself, so they have to sit beside it.  The list is the TRANSITIVE
+      # set: glass-sdl -> glass/audio and glass/mic -> reed, which is how the audio
+      # work arrived without anybody updating this line.
       - name: Sibling checkouts
         shell: bash
         run: |
-          for r in glass cram; do
+          for r in glass cram reed; do
             git clone --depth 1 -q https://github.com/modus-lisp/$r.git "$r"
           done
 
